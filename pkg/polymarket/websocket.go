@@ -68,6 +68,10 @@ func (c *Client) listenOnce(ctx context.Context, seen map[string]struct{}, handl
 	defer close(pingDone)
 	go pingLoop(conn, pingDone)
 
+	waitDone := make(chan struct{})
+	defer close(waitDone)
+	go waitLogLoop(waitDone)
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -90,6 +94,7 @@ func (c *Client) listenOnce(ctx context.Context, seen map[string]struct{}, handl
 
 		trades, ok := parseTradeMessage(data)
 		if !ok {
+			logNonTradeMessage(data)
 			continue
 		}
 		log.Printf("收到成交消息: payload_count=%d", len(trades))
@@ -109,6 +114,20 @@ func (c *Client) listenOnce(ctx context.Context, seen map[string]struct{}, handl
 	}
 }
 
+func waitLogLoop(done <-chan struct{}) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+			log.Println("等待 Polymarket 实时成交推送中...")
+		}
+	}
+}
+
 func pingLoop(conn *websocket.Conn, done <-chan struct{}) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
@@ -121,6 +140,25 @@ func pingLoop(conn *websocket.Conn, done <-chan struct{}) {
 			_ = conn.WriteMessage(websocket.TextMessage, []byte("ping"))
 		}
 	}
+}
+
+func logNonTradeMessage(data []byte) {
+	var message struct {
+		Topic string `json:"topic"`
+		Type  string `json:"type"`
+	}
+
+	if err := json.Unmarshal(data, &message); err != nil {
+		log.Printf("收到非 JSON 消息: %s", string(data))
+		return
+	}
+
+	if message.Topic == "" && message.Type == "" {
+		log.Printf("收到非成交消息: %s", string(data))
+		return
+	}
+
+	log.Printf("收到非成交消息: topic=%s type=%s", message.Topic, message.Type)
 }
 
 func parseTradeMessage(data []byte) ([]Trade, bool) {
