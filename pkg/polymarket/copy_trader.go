@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"math"
@@ -376,6 +377,9 @@ func (t *CopyTrader) handleTrade(ctx context.Context, repo *TradeRepository, tra
 	if skipReason == "" {
 		meta, err := t.fetchOrderBookMeta(ctx, assetID)
 		if err != nil {
+			if isContextDone(ctx, err) {
+				return
+			}
 			skipReason = "MARKET_NOT_TRADABLE"
 			row = t.buildCopyOrder(trade, 0, copyPrice, 0, skipReason)
 			log.Printf("跟单跳过：市场暂不可交易 asset=%s err=%v | %s | %s", shortID(assetID), err, nonEmpty(row.Outcome, "-"), nonEmpty(row.MarketTitle, "-"))
@@ -404,6 +408,9 @@ func (t *CopyTrader) handleTrade(ctx context.Context, repo *TradeRepository, tra
 
 	dbID, err := repo.InsertCopyOrderIfMissing(ctx, row)
 	if err != nil {
+		if isContextDone(ctx, err) {
+			return
+		}
 		log.Printf("跟单记录失败：wallet=%s err=%v", row.SourceWallet, err)
 		return
 	}
@@ -928,6 +935,10 @@ func (t *CopyTrader) calcSize(price float64, notional float64) float64 {
 
 func (t *CopyTrader) maxCopyUSDC() float64 {
 	return math.Max(t.cfg.CopyUSDC, t.cfg.MinCopyUSDC)
+}
+
+func isContextDone(ctx context.Context, err error) bool {
+	return ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 func (t *CopyTrader) copyNotionalForSource(sourceNotional float64) float64 {
