@@ -255,7 +255,6 @@ func (t *CopyTrader) handleTrade(ctx context.Context, repo *TradeRepository, tra
 	sourceSize := SafeFloat(trade["size"])
 	sourceNotional := roundFloat(price*sourceSize, 6)
 	assetID := firstString(trade, "asset")
-	minCopyNotional := t.actualCopyUSDC()
 
 	if side != "BUY" && side != "SELL" {
 		return
@@ -275,8 +274,6 @@ func (t *CopyTrader) handleTrade(ctx context.Context, repo *TradeRepository, tra
 	skipReason := ""
 	if price <= 0 {
 		skipReason = "PRICE_INVALID"
-	} else if sourceNotional < minCopyNotional {
-		skipReason = "SOURCE_NOTIONAL_TOO_SMALL"
 	} else if side == "BUY" {
 		copySize = t.calcBuySize(price)
 	} else {
@@ -305,14 +302,13 @@ func (t *CopyTrader) handleTrade(ctx context.Context, repo *TradeRepository, tra
 	}
 
 	if skipReason != "" {
-		log.Printf("跟单跳过：db_id=%d reason=%s | 源订单 %s %s 份，单价 %s，共 %s，小于跟单金额 %s | %s | %s",
+		log.Printf("跟单跳过：db_id=%d reason=%s | 源订单 %s %s 份，单价 %s，共 %s | %s | %s",
 			dbID,
 			skipReason,
 			side,
 			formatFloat(row.SourceSize, 6),
 			formatFloat(price, 6),
 			formatFloat(sourceNotional, 6),
-			formatFloat(minCopyNotional, 6),
 			nonEmpty(row.Outcome, "-"),
 			nonEmpty(row.MarketTitle, "-"),
 		)
@@ -320,9 +316,11 @@ func (t *CopyTrader) handleTrade(ctx context.Context, repo *TradeRepository, tra
 	}
 
 	log.Printf(
-		"跟单记录：db_id=%d trader=%s %s %s 份，单价 %s，共 %s | %s | %s",
+		"跟单记录：db_id=%d trader=%s 源订单金额 %s，按保底金额 %s 跟单：%s %s 份，单价 %s，共 %s | %s | %s",
 		dbID,
 		row.SourceWallet,
+		formatFloat(sourceNotional, 6),
+		formatFloat(t.actualCopyUSDC(), 6),
 		side,
 		formatFloat(copySize, 6),
 		formatFloat(price, 6),
