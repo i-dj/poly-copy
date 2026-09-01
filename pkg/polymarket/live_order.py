@@ -12,6 +12,25 @@ from py_clob_client_v2 import (
 )
 
 
+def resolve_order_type(order_type_text):
+    requested = str(order_type_text or "IOC").upper()
+
+    order_type = getattr(OrderType, requested, None)
+    if order_type is not None:
+        return order_type, requested
+
+    if requested == "IOC":
+        order_type = getattr(OrderType, "FOK", None)
+        if order_type is not None:
+            return order_type, "FOK"
+
+    order_type = getattr(OrderType, "GTC", None)
+    if order_type is None:
+        raise RuntimeError(f"unsupported order type: {requested}")
+
+    return order_type, "GTC"
+
+
 def main():
     req = json.load(sys.stdin)
 
@@ -75,8 +94,19 @@ def main():
         options=PartialCreateOrderOptions(tick_size=tick_size, neg_risk=neg_risk),
     )
 
-    order_type = OrderType.IOC if order_type_text == "IOC" else OrderType.GTC
+    order_type, effective_order_type = resolve_order_type(order_type_text)
     resp = client.post_order(signed_order, order_type)
+
+    if isinstance(resp, dict):
+        resp["requestedOrderType"] = order_type_text
+        resp["effectiveOrderType"] = effective_order_type
+    else:
+        resp = {
+            "response": resp,
+            "requestedOrderType": order_type_text,
+            "effectiveOrderType": effective_order_type,
+        }
+
     print(json.dumps(resp, ensure_ascii=False), flush=True)
 
 
