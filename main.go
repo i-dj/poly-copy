@@ -24,6 +24,11 @@ func main() {
 	defer db.Close()
 	log.Println("数据库连接成功")
 
+	repo := polymarket.NewTradeRepository(db)
+	if err := repo.EnsureSettledSchema(ctx); err != nil {
+		log.Fatal(err)
+	}
+
 	settlementInterval := 1 * time.Minute
 	copyWalletInterval := 1 * time.Minute
 	copyWalletLimit := 5
@@ -43,6 +48,7 @@ func main() {
 		PythonBin:           "python3",
 		LiveOrderScript:     "pkg/polymarket/live_order.py",
 		BalanceScript:       "pkg/polymarket/wallet_balance.py",
+		OrderStatusScript:   "pkg/polymarket/order_status.py",
 		MinSize:             0,
 		ReconnectDelay:      2 * time.Second,
 		SettlementBatchSize: 100,

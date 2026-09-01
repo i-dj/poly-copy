@@ -27,6 +27,12 @@ func StartCopyWalletSyncer(ctx context.Context, db *pgxpool.Pool, interval time.
 	}
 
 	repo := NewTradeRepository(db)
+	if err := repo.EnsureCopyWalletSchema(ctx); err != nil {
+		log.Printf("跟单钱包刷新失败：初始化 copy_wallet 字段失败 err=%v", err)
+	}
+	if err := repo.EnsureCopyWalletIndex(ctx); err != nil {
+		log.Printf("跟单钱包刷新提醒：创建 copy_wallet 钱包索引失败 err=%v", err)
+	}
 
 	log.Printf("跟单钱包刷新间隔：%s，候选数量：%d", interval, limit)
 	syncCopyWallets(ctx, repo, limit)
@@ -48,6 +54,9 @@ func syncCopyWallets(ctx context.Context, repo *TradeRepository, limit int) {
 	if err := repo.SyncCopyWalletSequence(ctx); err != nil {
 		log.Printf("跟单钱包刷新提醒：校准 copy_wallet 自增序列失败 err=%v", err)
 	}
+	if err := repo.BackfillCopyWalletMetrics(ctx); err != nil {
+		log.Printf("跟单钱包刷新提醒：回填 copy_wallet 战绩失败 err=%v", err)
+	}
 
 	candidates, err := repo.ListTopCopyWalletCandidates(ctx, limit)
 	if err != nil {
@@ -55,8 +64,8 @@ func syncCopyWallets(ctx context.Context, repo *TradeRepository, limit int) {
 		return
 	}
 
-	for _, candidate := range candidates {
-		inserted, err := repo.InsertCopyWalletIfMissing(ctx, candidate.Wallet)
+	for i, candidate := range candidates {
+		inserted, err := repo.UpsertCopyWalletCandidate(ctx, candidate, i+1)
 		if err != nil {
 			log.Printf("跟单钱包写入失败：wallet=%s err=%v", candidate.Wallet, err)
 			continue

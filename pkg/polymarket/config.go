@@ -12,6 +12,7 @@ type Config struct {
 	PythonBin           string
 	LiveOrderScript     string
 	BalanceScript       string
+	OrderStatusScript   string
 	MinSize             float64
 	ReconnectDelay      time.Duration
 	SettlementInterval  time.Duration

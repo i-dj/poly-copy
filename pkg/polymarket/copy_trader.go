@@ -26,8 +26,9 @@ type CopyTrader struct {
 }
 
 type CopyWallet struct {
-	Wallet       string
-	LastCopyTime sql.NullTime
+	Wallet            string
+	LastCopyTime      sql.NullTime
+	LastSeenTradeTime sql.NullTime
 }
 
 type CopyOrderRow struct {
@@ -86,6 +87,19 @@ type walletBalanceRequest struct {
 	FunderAddress string `json:"funder_address"`
 }
 
+type orderStatusRequest struct {
+	Host          string `json:"host"`
+	ChainID       int    `json:"chain_id"`
+	PrivateKey    string `json:"private_key"`
+	FunderAddress string `json:"funder_address"`
+	OrderID       string `json:"order_id"`
+}
+
+type liveOrderStatus struct {
+	Status      string
+	MatchedSize float64
+}
+
 type orderBookMeta struct {
 	MinOrderSize float64
 	TickSize     float64
@@ -127,6 +141,9 @@ func StartCopyTrader(ctx context.Context, db *pgxpool.Pool, cfg Config, pollInte
 	if cfg.BalanceScript == "" {
 		cfg.BalanceScript = "pkg/polymarket/wallet_balance.py"
 	}
+	if cfg.OrderStatusScript == "" {
+		cfg.OrderStatusScript = "pkg/polymarket/order_status.py"
+	}
 
 	trader := &CopyTrader{
 		cfg: cfg,
@@ -136,6 +153,12 @@ func StartCopyTrader(ctx context.Context, db *pgxpool.Pool, cfg Config, pollInte
 		seen: make(map[string]struct{}),
 	}
 	repo := NewTradeRepository(db)
+	if err := repo.EnsureCopyWalletSchema(ctx); err != nil {
+		log.Printf("跟单失败：初始化 copy_wallet 字段失败 err=%v", err)
+	}
+	if err := repo.EnsureCopyWalletIndex(ctx); err != nil {
+		log.Printf("跟单提醒：创建 copy_wallet 钱包索引失败 err=%v", err)
+	}
 
 	log.Printf(
 		"跟单程序启动：mode=%s max_copy_usdc=%s source_min=不限制 price_range=%s-%s skip_up_down=%t poll=%s sync=%s",
@@ -196,15 +219,19 @@ func (t *CopyTrader) processWallet(ctx context.Context, repo *TradeRepository, w
 
 	trades, err := t.fetchWalletTrades(ctx, wallet.Wallet, limit)
 	if err != nil {
+		if updateErr := repo.MarkCopyWalletError(ctx, wallet.Wallet, err); updateErr != nil {
+			log.Printf("跟单提醒：记录钱包错误失败 wallet=%s err=%v", wallet.Wallet, updateErr)
+		}
 		log.Printf("跟单失败：拉取钱包成交失败 wallet=%s err=%v", wallet.Wallet, err)
 		return
 	}
 
+	lastSeenTradeTime := latestTradeTime(trades)
 	if !wallet.LastCopyTime.Valid {
 		for _, trade := range trades {
 			t.markSeen(trade)
 		}
-		if err := repo.MarkCopyWalletChecked(ctx, wallet.Wallet); err != nil {
+		if err := repo.MarkCopyWalletChecked(ctx, wallet.Wallet, len(trades), 0, lastSeenTradeTime, nil); err != nil {
 			log.Printf("跟单提醒：初始化钱包时间失败 wallet=%s err=%v", wallet.Wallet, err)
 		}
 		log.Printf("跟单初始化：wallet=%s 已记录当前 %d 条成交，避免复制历史订单", wallet.Wallet, len(trades))
@@ -233,7 +260,7 @@ func (t *CopyTrader) processWallet(ctx context.Context, repo *TradeRepository, w
 		handled++
 	}
 
-	if err := repo.MarkCopyWalletChecked(ctx, wallet.Wallet); err != nil {
+	if err := repo.MarkCopyWalletChecked(ctx, wallet.Wallet, len(trades), handled, lastSeenTradeTime, nil); err != nil {
 		log.Printf("跟单提醒：更新钱包检查时间失败 wallet=%s err=%v", wallet.Wallet, err)
 	}
 
@@ -415,7 +442,13 @@ func (t *CopyTrader) handleTrade(ctx context.Context, repo *TradeRepository, tra
 	}
 
 	if err := repo.UpdateCopyOrderSuccess(ctx, dbID, resp); err != nil {
-		log.Printf("live 跟单成功后更新订单失败：db_id=%d err=%v", dbID, err)
+		logKeyEvent(
+			"下单成功但数据库回写失败",
+			"db_id=%d err=%v | order_response=%s",
+			dbID,
+			err,
+			string(resp),
+		)
 		return
 	}
 	logKeyEvent("下单成功", "db_id=%d %s %s 份，单价 %s，共 %s | order_response=%s",
@@ -520,6 +553,73 @@ func (t *CopyTrader) fetchWalletBalance(ctx context.Context) ([]byte, error) {
 	}
 
 	return append([]byte(nil), resp...), nil
+}
+
+func (t *CopyTrader) fetchLiveOrderStatus(ctx context.Context, orderID string) (liveOrderStatus, error) {
+	if strings.TrimSpace(orderID) == "" {
+		return liveOrderStatus{}, fmt.Errorf("缺少 order_id")
+	}
+	if strings.TrimSpace(t.cfg.PrivateKey) == "" {
+		return liveOrderStatus{}, fmt.Errorf("live 模式缺少 POLYMARKET_PRIVATE_KEY")
+	}
+	if strings.TrimSpace(t.cfg.FunderAddress) == "" {
+		return liveOrderStatus{}, fmt.Errorf("live 模式缺少 POLYMARKET_PROXY_ADDRESS")
+	}
+
+	payload, err := json.Marshal(orderStatusRequest{
+		Host:          t.cfg.CLOBURL,
+		ChainID:       137,
+		PrivateKey:    t.cfg.PrivateKey,
+		FunderAddress: t.cfg.FunderAddress,
+		OrderID:       orderID,
+	})
+	if err != nil {
+		return liveOrderStatus{}, err
+	}
+
+	cmd := exec.CommandContext(ctx, t.cfg.PythonBin, t.cfg.OrderStatusScript)
+	cmd.Stdin = bytes.NewReader(payload)
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		message := strings.TrimSpace(stderr.String())
+		if message == "" {
+			message = strings.TrimSpace(stdout.String())
+		}
+		if message == "" {
+			message = err.Error()
+		}
+		return liveOrderStatus{}, fmt.Errorf("查询订单状态失败: %s", message)
+	}
+
+	resp := bytes.TrimSpace(stdout.Bytes())
+	if len(resp) == 0 {
+		return liveOrderStatus{}, fmt.Errorf("查询订单状态失败: 空响应")
+	}
+
+	return parseLiveOrderStatus(resp)
+}
+
+func parseLiveOrderStatus(resp []byte) (liveOrderStatus, error) {
+	var data map[string]any
+	if err := json.Unmarshal(resp, &data); err != nil {
+		return liveOrderStatus{}, err
+	}
+
+	status := firstResponseString(data, "status", "order_status", "state")
+	matchedSize := firstResponseFloat(data, "size_matched", "matchedSize", "matched_size", "filled_size", "filledSize")
+	if matchedSize == 0 {
+		matchedSize = firstResponseFloat(data, "sizeMatched", "filled")
+	}
+
+	return liveOrderStatus{
+		Status:      status,
+		MatchedSize: matchedSize,
+	}, nil
 }
 
 func (t *CopyTrader) logWalletBalanceIfDue(ctx context.Context) {
@@ -653,6 +753,21 @@ func (t *CopyTrader) syncCopyOrders(ctx context.Context, repo *TradeRepository) 
 			matchedSize = row.CopySize
 		}
 
+		status := row.OrderStatus.String
+		if strings.ToLower(t.cfg.CopyMode) == "live" && row.OrderID.Valid {
+			info, err := t.fetchLiveOrderStatus(ctx, row.OrderID.String)
+			if err != nil {
+				log.Printf("订单修改失败：查询 live 订单状态失败 db_id=%d order_id=%s err=%v", row.ID, row.OrderID.String, err)
+			} else {
+				if info.Status != "" {
+					status = info.Status
+				}
+				if info.MatchedSize > 0 {
+					matchedSize = info.MatchedSize
+				}
+			}
+		}
+
 		totalPNL := 0.0
 		if matchedSize > 0 {
 			switch strings.ToUpper(row.CopySide) {
@@ -664,12 +779,12 @@ func (t *CopyTrader) syncCopyOrders(ctx context.Context, repo *TradeRepository) 
 		}
 
 		isFilled := matchedSize >= row.CopySize && row.CopySize > 0
-		status := row.OrderStatus.String
 		if status == "" {
 			status = "PAPER"
 		}
+		isCancelled := strings.EqualFold(status, "CANCELLED") || strings.EqualFold(status, "CANCELED")
 
-		if err := repo.UpdateCopyOrderPNL(ctx, row.ID, status, matchedSize, row.CopyPrice, isFilled, false, totalPNL); err != nil {
+		if err := repo.UpdateCopyOrderPNL(ctx, row.ID, status, matchedSize, row.CopyPrice, isFilled, isCancelled, totalPNL); err != nil {
 			log.Printf("跟单同步失败：更新 copy_order id=%d err=%v", row.ID, err)
 			continue
 		}
@@ -781,6 +896,17 @@ func (t *CopyTrader) markSeen(trade Trade) {
 	if key != "" {
 		t.seen[key] = struct{}{}
 	}
+}
+
+func latestTradeTime(trades []Trade) time.Time {
+	var latest time.Time
+	for _, trade := range trades {
+		tradeTime := parseTradeTime(trade["timestamp"])
+		if latest.IsZero() || tradeTime.After(latest) {
+			latest = tradeTime
+		}
+	}
+	return latest
 }
 
 func marketURL(trade Trade) string {

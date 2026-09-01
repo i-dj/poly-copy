@@ -49,6 +49,33 @@ func NewTradeRepository(db *pgxpool.Pool) *TradeRepository {
 	return &TradeRepository{db: db}
 }
 
+func (r *TradeRepository) EnsureSettledSchema(ctx context.Context) error {
+	_, err := r.db.Exec(ctx, `
+		CREATE TABLE IF NOT EXISTS settled (
+			id integer NOT NULL PRIMARY KEY,
+			wallet varchar(255),
+			amount money,
+			result integer,
+			update_time time with time zone
+		);
+
+		CREATE SEQUENCE IF NOT EXISTS settled_id_seq;
+
+		SELECT setval(
+			'settled_id_seq',
+			COALESCE((SELECT MAX(id) FROM settled), 0) + 1,
+			false
+		);
+
+		ALTER TABLE settled
+		ALTER COLUMN id SET DEFAULT nextval('settled_id_seq');
+
+		CREATE INDEX IF NOT EXISTS settled_wallet_idx
+		ON settled (wallet);
+	`)
+	return err
+}
+
 func (r *TradeRepository) ProcessTrade(ctx context.Context, row TradeRow) (TradeProcessResult, error) {
 	tx, err := r.db.Begin(ctx)
 	if err != nil {
@@ -177,26 +204,35 @@ func (r *TradeRepository) ListTopCopyWalletCandidates(ctx context.Context, limit
 	}
 
 	rows, err := r.db.Query(ctx, `
+		WITH stats AS (
+			SELECT
+				wallet,
+				COUNT(*) AS closed_count,
+				ROUND(SUM(ABS(amount::numeric)), 6) AS total_cost,
+				ROUND(SUM(amount::numeric), 6) AS net_pnl,
+				ROUND(SUM(amount::numeric) / NULLIF(SUM(ABS(amount::numeric)), 0) * 100, 2) AS roi_pct,
+				ROUND(SUM(amount::numeric) / NULLIF(SUM(ABS(amount::numeric)), 0), 6) AS profit_per_usdc,
+				ROUND(
+					COUNT(*) FILTER (WHERE result = 1)::numeric / NULLIF(COUNT(*), 0) * 100,
+					2
+				) AS win_rate_pct
+			FROM settled
+			WHERE wallet IS NOT NULL
+				AND wallet <> ''
+			GROUP BY wallet
+		)
 		SELECT
 			wallet,
-			COUNT(*) AS closed_count,
-			ROUND(SUM(size * price), 6) AS total_cost,
-			ROUND(SUM(realized_pnl), 6) AS net_pnl,
-			ROUND(SUM(realized_pnl) / NULLIF(SUM(size * price), 0) * 100, 2) AS roi_pct,
-			ROUND(SUM(realized_pnl) / NULLIF(SUM(size * price), 0), 6) AS profit_per_usdc,
-			ROUND(
-				COUNT(*) FILTER (WHERE realized_pnl > 0)::numeric / NULLIF(COUNT(*), 0) * 100,
-				2
-			) AS win_rate_pct
-		FROM polymarket_trades
-		WHERE status IN ('CLOSED', 'SETTLED')
-			AND wallet IS NOT NULL
-			AND wallet <> ''
-		GROUP BY wallet
-		HAVING COUNT(*) >= 10
-			AND SUM(size * price) >= 20
-			AND SUM(realized_pnl) > 0
-		ORDER BY profit_per_usdc DESC, net_pnl DESC
+			closed_count,
+			total_cost,
+			net_pnl,
+			roi_pct,
+			profit_per_usdc,
+			win_rate_pct
+		FROM stats
+		WHERE win_rate_pct >= 80
+			AND net_pnl > 0
+		ORDER BY win_rate_pct DESC, net_pnl DESC, closed_count DESC
 		LIMIT $1
 	`, limit)
 	if err != nil {
@@ -228,25 +264,142 @@ func (r *TradeRepository) ListTopCopyWalletCandidates(ctx context.Context, limit
 	return candidates, nil
 }
 
-func (r *TradeRepository) InsertCopyWalletIfMissing(ctx context.Context, wallet string) (bool, error) {
-	if wallet == "" {
+func (r *TradeRepository) EnsureCopyWalletSchema(ctx context.Context) error {
+	_, err := r.db.Exec(ctx, `
+		ALTER TABLE copy_wallet
+		ADD COLUMN IF NOT EXISTS closed_count integer DEFAULT 0,
+		ADD COLUMN IF NOT EXISTS total_cost numeric(30, 12) DEFAULT 0,
+		ADD COLUMN IF NOT EXISTS net_pnl numeric(30, 12) DEFAULT 0,
+		ADD COLUMN IF NOT EXISTS roi_pct numeric(30, 12) DEFAULT 0,
+		ADD COLUMN IF NOT EXISTS profit_per_usdc numeric(30, 12) DEFAULT 0,
+		ADD COLUMN IF NOT EXISTS win_rate_pct numeric(30, 12) DEFAULT 0,
+		ADD COLUMN IF NOT EXISTS candidate_rank integer,
+		ADD COLUMN IF NOT EXISTS last_candidate_at timestamptz,
+		ADD COLUMN IF NOT EXISTS last_checked_at timestamptz,
+		ADD COLUMN IF NOT EXISTS last_seen_trade_time timestamptz,
+		ADD COLUMN IF NOT EXISTS last_fetch_count integer DEFAULT 0,
+		ADD COLUMN IF NOT EXISTS last_new_trade_count integer DEFAULT 0,
+		ADD COLUMN IF NOT EXISTS last_error text,
+		ADD COLUMN IF NOT EXISTS updated_at timestamptz DEFAULT now()
+	`)
+	return err
+}
+
+func (r *TradeRepository) EnsureCopyWalletIndex(ctx context.Context) error {
+	_, err := r.db.Exec(ctx, `
+		CREATE INDEX IF NOT EXISTS copy_wallet_wallet_idx
+		ON copy_wallet (wallet)
+	`)
+	return err
+}
+
+func (r *TradeRepository) BackfillCopyWalletMetrics(ctx context.Context) error {
+	_, err := r.db.Exec(ctx, `
+		WITH stats AS (
+			SELECT
+				wallet,
+				COUNT(*) AS closed_count,
+				ROUND(SUM(ABS(amount::numeric)), 6) AS total_cost,
+				ROUND(SUM(amount::numeric), 6) AS net_pnl,
+				ROUND(SUM(amount::numeric) / NULLIF(SUM(ABS(amount::numeric)), 0) * 100, 2) AS roi_pct,
+				ROUND(SUM(amount::numeric) / NULLIF(SUM(ABS(amount::numeric)), 0), 6) AS profit_per_usdc,
+				ROUND(
+					COUNT(*) FILTER (WHERE result = 1)::numeric / NULLIF(COUNT(*), 0) * 100,
+					2
+				) AS win_rate_pct
+			FROM settled
+			WHERE wallet IS NOT NULL
+				AND wallet <> ''
+			GROUP BY wallet
+		)
+		UPDATE copy_wallet AS cw
+		SET
+			closed_count = stats.closed_count,
+			total_cost = stats.total_cost,
+			net_pnl = stats.net_pnl,
+			roi_pct = stats.roi_pct,
+			profit_per_usdc = stats.profit_per_usdc,
+			win_rate_pct = stats.win_rate_pct,
+			updated_at = now()
+		FROM stats
+		WHERE cw.wallet = stats.wallet
+	`)
+	return err
+}
+
+func (r *TradeRepository) UpsertCopyWalletCandidate(ctx context.Context, candidate CopyWalletCandidate, rank int) (bool, error) {
+	if candidate.Wallet == "" {
 		return false, nil
 	}
 
-	result, err := r.db.Exec(ctx, `
-		INSERT INTO copy_wallet (wallet, enable, last_copy_time)
-		SELECT $1, 1, NULL
+	var inserted bool
+	err := r.db.QueryRow(ctx, `
+		INSERT INTO copy_wallet (
+			wallet,
+			enable,
+			last_copy_time,
+			closed_count,
+			total_cost,
+			net_pnl,
+			roi_pct,
+			profit_per_usdc,
+			win_rate_pct,
+			candidate_rank,
+			last_candidate_at,
+			updated_at
+		)
+		SELECT $1, 1, NULL, $2, $3, $4, $5, $6, $7, $8, now(), now()
 		WHERE NOT EXISTS (
 			SELECT 1
 			FROM copy_wallet
 			WHERE wallet = $1
 		)
-	`, wallet)
+		RETURNING true
+	`,
+		candidate.Wallet,
+		candidate.ClosedCount,
+		candidate.TotalCost,
+		candidate.NetPNL,
+		candidate.ROIPct,
+		candidate.ProfitPerUSDC,
+		candidate.WinRatePct,
+		rank,
+	).Scan(&inserted)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return false, err
+	}
+	if errors.Is(err, pgx.ErrNoRows) {
+		inserted = false
+	}
+
+	_, err = r.db.Exec(ctx, `
+		UPDATE copy_wallet
+		SET
+			closed_count = $2,
+			total_cost = $3,
+			net_pnl = $4,
+			roi_pct = $5,
+			profit_per_usdc = $6,
+			win_rate_pct = $7,
+			candidate_rank = $8,
+			last_candidate_at = now(),
+			updated_at = now()
+		WHERE wallet = $1
+	`,
+		candidate.Wallet,
+		candidate.ClosedCount,
+		candidate.TotalCost,
+		candidate.NetPNL,
+		candidate.ROIPct,
+		candidate.ProfitPerUSDC,
+		candidate.WinRatePct,
+		rank,
+	)
 	if err != nil {
 		return false, err
 	}
 
-	return result.RowsAffected() > 0, nil
+	return inserted, nil
 }
 
 func (r *TradeRepository) SyncCopyWalletSequence(ctx context.Context) error {
@@ -262,7 +415,7 @@ func (r *TradeRepository) SyncCopyWalletSequence(ctx context.Context) error {
 
 func (r *TradeRepository) ListEnabledCopyWallets(ctx context.Context) ([]CopyWallet, error) {
 	rows, err := r.db.Query(ctx, `
-		SELECT wallet, last_copy_time
+		SELECT wallet, last_copy_time, last_seen_trade_time
 		FROM copy_wallet
 		WHERE enable = 1
 			AND wallet IS NOT NULL
@@ -277,7 +430,7 @@ func (r *TradeRepository) ListEnabledCopyWallets(ctx context.Context) ([]CopyWal
 	var wallets []CopyWallet
 	for rows.Next() {
 		var wallet CopyWallet
-		if err := rows.Scan(&wallet.Wallet, &wallet.LastCopyTime); err != nil {
+		if err := rows.Scan(&wallet.Wallet, &wallet.LastCopyTime, &wallet.LastSeenTradeTime); err != nil {
 			return nil, err
 		}
 		wallets = append(wallets, wallet)
@@ -290,16 +443,49 @@ func (r *TradeRepository) ListEnabledCopyWallets(ctx context.Context) ([]CopyWal
 	return wallets, nil
 }
 
-func (r *TradeRepository) MarkCopyWalletChecked(ctx context.Context, wallet string) error {
+func (r *TradeRepository) MarkCopyWalletChecked(ctx context.Context, wallet string, fetchedCount int, newTradeCount int, lastSeenTradeTime time.Time, lastErr error) error {
 	if wallet == "" {
 		return nil
 	}
 
+	var errText any
+	if lastErr != nil {
+		errText = lastErr.Error()
+	}
+
 	_, err := r.db.Exec(ctx, `
 		UPDATE copy_wallet
-		SET last_copy_time = now()
+		SET
+			last_copy_time = now(),
+			last_checked_at = now(),
+			last_fetch_count = $2,
+			last_new_trade_count = $3,
+			last_seen_trade_time = COALESCE($4, last_seen_trade_time),
+			last_error = $5,
+			updated_at = now()
 		WHERE wallet = $1
-	`, wallet)
+	`, wallet, fetchedCount, newTradeCount, nullTime(lastSeenTradeTime), errText)
+	return err
+}
+
+func (r *TradeRepository) MarkCopyWalletError(ctx context.Context, wallet string, lastErr error) error {
+	if wallet == "" {
+		return nil
+	}
+
+	var errText any
+	if lastErr != nil {
+		errText = lastErr.Error()
+	}
+
+	_, err := r.db.Exec(ctx, `
+		UPDATE copy_wallet
+		SET
+			last_checked_at = now(),
+			last_error = $2,
+			updated_at = now()
+		WHERE wallet = $1
+	`, wallet, errText)
 	return err
 }
 
@@ -471,9 +657,9 @@ func (r *TradeRepository) UpdateCopyOrderSuccess(ctx context.Context, id int64, 
 			order_id = $1,
 			order_status = $2,
 			raw_response = $3::jsonb,
-			matched_size = $4,
-			filled_notional = $5,
-			is_filled = CASE WHEN $4 > 0 THEN true ELSE false END,
+			matched_size = $4::numeric,
+			filled_notional = $5::numeric,
+			is_filled = CASE WHEN $4::numeric > 0 THEN true ELSE false END,
 			submitted_at = now(),
 			updated_at = now()
 		WHERE id = $6
@@ -709,6 +895,7 @@ func (r *TradeRepository) settleOpenTrades(ctx context.Context, tx pgx.Tx, asset
 		WITH candidates AS (
 			SELECT
 				id,
+				wallet,
 				size,
 				price,
 				remaining_size,
@@ -743,7 +930,22 @@ func (r *TradeRepository) settleOpenTrades(ctx context.Context, tx pgx.Tx, asset
 				updated_at = now()
 			FROM candidates AS c
 			WHERE t.id = c.id
-			RETURNING ((c.remaining_size * $1) - (c.remaining_size * c.price)) AS settlement_pnl
+			RETURNING
+				c.wallet,
+				((c.remaining_size * $1) - (c.remaining_size * c.price)) AS settlement_pnl
+		),
+		settled_events AS (
+			INSERT INTO settled (wallet, amount, result, update_time)
+			SELECT
+				wallet,
+				ROUND(settlement_pnl, 6)::numeric::money,
+				CASE WHEN settlement_pnl > 0 THEN 1 ELSE 0 END,
+				now()::timetz
+			FROM updated
+			WHERE wallet IS NOT NULL
+				AND wallet <> ''
+				AND settlement_pnl <> 0
+			RETURNING id
 		)
 		SELECT COUNT(*), COALESCE(SUM(settlement_pnl), 0)
 		FROM updated
@@ -847,12 +1049,33 @@ func (r *TradeRepository) closeBuyTrades(ctx context.Context, tx pgx.Tx, sell Tr
 			return closed, totalRealized, remainingSell, err
 		}
 
+		if err := r.insertSettledEvent(ctx, tx, sell.Wallet, realized); err != nil {
+			return closed, totalRealized, remainingSell, err
+		}
+
 		closed++
 		totalRealized += realized
 		remainingSell -= closeSize
 	}
 
 	return closed, totalRealized, remainingSell, nil
+}
+
+func (r *TradeRepository) insertSettledEvent(ctx context.Context, tx pgx.Tx, wallet string, amount float64) error {
+	if wallet == "" || amount == 0 {
+		return nil
+	}
+
+	result := 0
+	if amount > 0 {
+		result = 1
+	}
+
+	_, err := tx.Exec(ctx, `
+		INSERT INTO settled (wallet, amount, result, update_time)
+		VALUES ($1, $2::numeric::money, $3, now()::timetz)
+	`, wallet, roundFloat(amount, 6), result)
+	return err
 }
 
 func nullString(value string) any {
