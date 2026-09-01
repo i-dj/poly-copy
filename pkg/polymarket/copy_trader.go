@@ -100,6 +100,15 @@ func StartCopyTrader(ctx context.Context, db *sql.DB, cfg Config, pollInterval, 
 	if cfg.CopyTradeLimit <= 0 {
 		cfg.CopyTradeLimit = 10
 	}
+	if cfg.MinSourceNotional <= 0 {
+		cfg.MinSourceNotional = 20
+	}
+	if cfg.MinCopyPrice <= 0 {
+		cfg.MinCopyPrice = 0.05
+	}
+	if cfg.MaxCopyPrice <= 0 {
+		cfg.MaxCopyPrice = 0.95
+	}
 	if cfg.PythonBin == "" {
 		cfg.PythonBin = "python3"
 	}
@@ -117,11 +126,13 @@ func StartCopyTrader(ctx context.Context, db *sql.DB, cfg Config, pollInterval, 
 	repo := NewTradeRepository(db)
 
 	log.Printf(
-		"跟单程序启动：mode=%s copy_usdc=%s min_copy_usdc=%s max_copy_usdc=%s poll=%s sync=%s",
+		"跟单程序启动：mode=%s max_copy_usdc=%s min_source_notional=%s price_range=%s-%s skip_up_down=%t poll=%s sync=%s",
 		strings.ToLower(cfg.CopyMode),
-		formatFloat(cfg.CopyUSDC, 6),
-		formatFloat(cfg.MinCopyUSDC, 6),
 		formatFloat(trader.maxCopyUSDC(), 6),
+		formatFloat(cfg.MinSourceNotional, 6),
+		formatFloat(cfg.MinCopyPrice, 6),
+		formatFloat(cfg.MaxCopyPrice, 6),
+		cfg.SkipUpDownMarkets,
 		pollInterval,
 		syncInterval,
 	)
@@ -283,6 +294,12 @@ func (t *CopyTrader) handleTrade(ctx context.Context, repo *TradeRepository, tra
 		skipReason = "PRICE_INVALID"
 	} else if sourceNotional <= 0 {
 		skipReason = "SOURCE_NOTIONAL_INVALID"
+	} else if sourceNotional < t.cfg.MinSourceNotional {
+		skipReason = "SOURCE_NOTIONAL_BELOW_MIN"
+	} else if price < t.cfg.MinCopyPrice || price > t.cfg.MaxCopyPrice {
+		skipReason = "PRICE_OUT_OF_RANGE"
+	} else if t.cfg.SkipUpDownMarkets && isUpDownMarket(trade) {
+		skipReason = "SHORT_TERM_UP_DOWN_MARKET"
 	} else if side == "BUY" {
 		copySize = t.calcSize(price, targetNotional)
 	} else {
@@ -329,13 +346,16 @@ func (t *CopyTrader) handleTrade(ctx context.Context, repo *TradeRepository, tra
 	}
 
 	if skipReason != "" {
-		log.Printf("跟单跳过：db_id=%d reason=%s | 源订单 %s %s 份，单价 %s，共 %s | %s | %s",
+		log.Printf("跟单跳过：db_id=%d reason=%s | 源订单 %s %s 份，单价 %s，共 %s | 过滤条件 min_source=%s price_range=%s-%s | %s | %s",
 			dbID,
 			skipReason,
 			side,
 			formatFloat(row.SourceSize, 6),
 			formatFloat(price, 6),
 			formatFloat(sourceNotional, 6),
+			formatFloat(t.cfg.MinSourceNotional, 6),
+			formatFloat(t.cfg.MinCopyPrice, 6),
+			formatFloat(t.cfg.MaxCopyPrice, 6),
 			nonEmpty(row.Outcome, "-"),
 			nonEmpty(row.MarketTitle, "-"),
 		)
@@ -632,6 +652,15 @@ func marketURL(trade Trade) string {
 		return ""
 	}
 	return "https://polymarket.com/event/" + slug
+}
+
+func isUpDownMarket(trade Trade) bool {
+	title := strings.ToLower(firstString(trade, "title", "market", "marketTitle"))
+	slug := strings.ToLower(firstString(trade, "eventSlug", "slug"))
+
+	return strings.Contains(title, " up or down") ||
+		strings.Contains(slug, "updown") ||
+		strings.Contains(slug, "up-or-down")
 }
 
 func nullableSQLString(value string) sql.NullString {

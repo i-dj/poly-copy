@@ -49,6 +49,10 @@ func main() {
 		CopyUSDC:            1,
 		MinCopyUSDC:         5,
 		CopyTradeLimit:      10,
+		MinSourceNotional:   20,
+		MinCopyPrice:        0.05,
+		MaxCopyPrice:        0.95,
+		SkipUpDownMarkets:   true,
 	}
 
 	go polymarket.StartSettlementScanner(ctx, db, cfg, settlementInterval)
