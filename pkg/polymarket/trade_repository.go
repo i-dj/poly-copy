@@ -3,8 +3,11 @@ package polymarket
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
+	"strings"
 	"time"
 )
 
@@ -256,6 +259,326 @@ func (r *TradeRepository) SyncCopyWalletSequence(ctx context.Context) error {
 			false
 		)
 	`)
+	return err
+}
+
+func (r *TradeRepository) ListEnabledCopyWallets(ctx context.Context) ([]CopyWallet, error) {
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT wallet, last_copy_time
+		FROM copy_wallet
+		WHERE enable = 1
+			AND wallet IS NOT NULL
+			AND wallet <> ''
+		ORDER BY id ASC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var wallets []CopyWallet
+	for rows.Next() {
+		var wallet CopyWallet
+		if err := rows.Scan(&wallet.Wallet, &wallet.LastCopyTime); err != nil {
+			return nil, err
+		}
+		wallets = append(wallets, wallet)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return wallets, nil
+}
+
+func (r *TradeRepository) MarkCopyWalletChecked(ctx context.Context, wallet string) error {
+	if wallet == "" {
+		return nil
+	}
+
+	_, err := r.db.ExecContext(ctx, `
+		UPDATE copy_wallet
+		SET last_copy_time = now()
+		WHERE wallet = $1
+	`, wallet)
+	return err
+}
+
+func (r *TradeRepository) GetAvailableCopyPosition(ctx context.Context, assetID string) (float64, error) {
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT copy_side, copy_size, matched_size, dry_run, submit_success
+		FROM copy_orders
+		WHERE asset_id = $1
+			AND COALESCE(is_cancelled, false) = false
+			AND (
+				dry_run = true
+				OR submit_success = true
+			)
+	`, assetID)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+
+	qty := 0.0
+	for rows.Next() {
+		var side string
+		var copySize float64
+		var matchedSize sql.NullFloat64
+		var dryRun bool
+		var submitSuccess bool
+
+		if err := rows.Scan(&side, &copySize, &matchedSize, &dryRun, &submitSuccess); err != nil {
+			return 0, err
+		}
+
+		size := nullFloatValue(matchedSize)
+		if dryRun {
+			size = copySize
+		}
+		if !dryRun && !submitSuccess {
+			continue
+		}
+
+		switch strings.ToUpper(side) {
+		case "BUY":
+			qty += size
+		case "SELL":
+			qty -= size
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+
+	if qty < 0 {
+		return 0, nil
+	}
+	return roundFloat(qty, 6), nil
+}
+
+func (r *TradeRepository) InsertCopyOrderIfMissing(ctx context.Context, row CopyOrderInsert) (int64, error) {
+	var id int64
+	err := r.db.QueryRowContext(ctx, `
+		INSERT INTO copy_orders (
+			source_wallet,
+			source_tx_hash,
+			source_side,
+			source_size,
+			source_price,
+			source_notional,
+			source_timestamp,
+			market_title,
+			condition_id,
+			asset_id,
+			outcome,
+			market_url,
+			copy_side,
+			copy_size,
+			copy_price,
+			copy_notional,
+			order_type,
+			dry_run,
+			submit_success,
+			skip_reason,
+			order_status,
+			raw_response,
+			detected_at,
+			updated_at
+		)
+		SELECT
+			$1, $2, $3, $4, $5, $6, $7, $8,
+			$9, $10, $11, $12, $13, $14, $15, $16,
+			$17, $18, $19, $20, $21, $22::jsonb,
+			now(), now()
+		WHERE NOT EXISTS (
+			SELECT 1
+			FROM copy_orders
+			WHERE source_wallet = $1
+				AND source_tx_hash = $2
+				AND asset_id = $10
+				AND source_side = $3
+				AND source_size = $4
+				AND source_price = $5
+		)
+		RETURNING id
+	`,
+		row.SourceWallet,
+		row.SourceTxHash,
+		row.SourceSide,
+		row.SourceSize,
+		row.SourcePrice,
+		row.SourceNotional,
+		nullTime(row.SourceTimestamp),
+		nullString(row.MarketTitle),
+		nullString(row.ConditionID),
+		row.AssetID,
+		nullString(row.Outcome),
+		nullString(row.MarketURL),
+		row.CopySide,
+		row.CopySize,
+		row.CopyPrice,
+		row.CopyNotional,
+		row.OrderType,
+		row.DryRun,
+		row.SubmitSuccess,
+		row.SkipReason,
+		row.OrderStatus,
+		string(row.RawResponse),
+	).Scan(&id)
+	if err == nil {
+		return id, nil
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	return 0, err
+}
+
+func (r *TradeRepository) MarkPaperCopyOrderSuccess(ctx context.Context, id int64) error {
+	_, err := r.db.ExecContext(ctx, `
+		UPDATE copy_orders
+		SET
+			submit_success = true,
+			matched_size = copy_size,
+			filled_notional = copy_notional,
+			is_filled = true,
+			submitted_at = now(),
+			updated_at = now()
+		WHERE id = $1
+	`, id)
+	return err
+}
+
+func (r *TradeRepository) UpdateCopyOrderSuccess(ctx context.Context, id int64, rawResponse []byte) error {
+	var resp map[string]any
+	if err := json.Unmarshal(rawResponse, &resp); err != nil {
+		resp = map[string]any{}
+	}
+
+	orderID := firstResponseString(resp, "orderID", "orderId", "id")
+	orderStatus := firstResponseString(resp, "status", "order_status")
+	if orderStatus == "" {
+		orderStatus = "SUBMITTED"
+	}
+	matchedSize := firstResponseFloat(resp, "size_matched", "matchedSize")
+	filledNotional := firstResponseFloat(resp, "takingAmount", "makingAmount")
+
+	_, err := r.db.ExecContext(ctx, `
+		UPDATE copy_orders
+		SET
+			submit_success = true,
+			order_id = $1,
+			order_status = $2,
+			raw_response = $3::jsonb,
+			matched_size = $4,
+			filled_notional = $5,
+			is_filled = CASE WHEN $4 > 0 THEN true ELSE false END,
+			submitted_at = now(),
+			updated_at = now()
+		WHERE id = $6
+	`, nullableString(true, orderID), orderStatus, string(rawResponse), matchedSize, filledNotional, id)
+	return err
+}
+
+func (r *TradeRepository) UpdateCopyOrderError(ctx context.Context, id int64, orderErr error) error {
+	raw, _ := json.Marshal(map[string]any{
+		"error": orderErr.Error(),
+		"type":  fmt.Sprintf("%T", orderErr),
+	})
+
+	_, err := r.db.ExecContext(ctx, `
+		UPDATE copy_orders
+		SET
+			submit_success = false,
+			order_status = 'FAILED',
+			error_message = $1,
+			raw_response = $2::jsonb,
+			updated_at = now()
+		WHERE id = $3
+	`, orderErr.Error(), string(raw), id)
+	return err
+}
+
+func (r *TradeRepository) ListCopyOrdersForSync(ctx context.Context, staleAfter time.Duration, limit int) ([]CopyOrderRow, error) {
+	if staleAfter <= 0 {
+		staleAfter = time.Minute
+	}
+	if limit <= 0 {
+		limit = 100
+	}
+
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT
+			id,
+			asset_id,
+			copy_side,
+			copy_size,
+			copy_price,
+			order_id,
+			dry_run,
+			submit_success,
+			order_status,
+			matched_size
+		FROM copy_orders
+		WHERE skip_reason IS NULL
+			AND COALESCE(is_cancelled, false) = false
+			AND (
+				pnl_checked_at IS NULL
+				OR pnl_checked_at < now() - ($1::text)::interval
+			)
+		ORDER BY id DESC
+		LIMIT $2
+	`, fmt.Sprintf("%f seconds", staleAfter.Seconds()), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var orders []CopyOrderRow
+	for rows.Next() {
+		var order CopyOrderRow
+		if err := rows.Scan(
+			&order.ID,
+			&order.AssetID,
+			&order.CopySide,
+			&order.CopySize,
+			&order.CopyPrice,
+			&order.OrderID,
+			&order.DryRun,
+			&order.SubmitSuccess,
+			&order.OrderStatus,
+			&order.MatchedSize,
+		); err != nil {
+			return nil, err
+		}
+		orders = append(orders, order)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return orders, nil
+}
+
+func (r *TradeRepository) UpdateCopyOrderPNL(ctx context.Context, id int64, orderStatus string, matchedSize float64, copyPrice float64, isFilled bool, isCancelled bool, totalPNL float64) error {
+	_, err := r.db.ExecContext(ctx, `
+		UPDATE copy_orders
+		SET
+			order_status = $1,
+			matched_size = $2,
+			filled_notional = $3,
+			is_filled = $4,
+			is_cancelled = $5,
+			unrealized_pnl = $6,
+			total_pnl = $6,
+			pnl_checked_at = now(),
+			updated_at = now()
+		WHERE id = $7
+	`, orderStatus, matchedSize, roundFloat(matchedSize*copyPrice, 6), isFilled, isCancelled, roundFloat(totalPNL, 6), id)
 	return err
 }
 
@@ -567,4 +890,24 @@ func nullFloatValue(value sql.NullFloat64) float64 {
 		return 0
 	}
 	return value.Float64
+}
+
+func firstResponseString(resp map[string]any, keys ...string) string {
+	for _, key := range keys {
+		value := strings.TrimSpace(stringValue(resp[key]))
+		if value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func firstResponseFloat(resp map[string]any, keys ...string) float64 {
+	for _, key := range keys {
+		value := SafeFloat(resp[key])
+		if value != 0 {
+			return value
+		}
+	}
+	return 0
 }
