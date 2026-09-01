@@ -25,14 +25,11 @@ func main() {
 
 	cfg := polymarket.Config{
 		WSURL:          "wss://ws-live-data.polymarket.com",
-		LeaderboardURL: "https://data-api.polymarket.com/v1/leaderboard",
 		MinSize:        0,
-		PNLCacheTTL:    300 * time.Second,
-		PNLTimeout:     8 * time.Second,
 		ReconnectDelay: 5 * time.Second,
 	}
 
-	if err := polymarket.RunMonitor(ctx, db, cfg); err != nil {
+	if err := polymarket.RunTradeTracker(ctx, db, cfg); err != nil {
 		log.Fatal(err)
 	}
 }
