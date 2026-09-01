@@ -16,7 +16,7 @@ func (c *Client) ListenAllTrades(ctx context.Context, handler TradeHandler) erro
 	seen := make(map[string]struct{})
 
 	for {
-		log.Printf("正在连接 Polymarket WebSocket: %s", c.cfg.WSURL)
+		log.Println("正在连接 Polymarket WebSocket...")
 		if err := c.listenOnce(ctx, seen, handler); err != nil {
 			if errors.Is(err, context.Canceled) {
 				return err
@@ -62,7 +62,7 @@ func (c *Client) listenOnce(ctx context.Context, seen map[string]struct{}, handl
 	}); err != nil {
 		return err
 	}
-	log.Println("已订阅全市场实时成交 activity/trades")
+	log.Println("已订阅全市场实时成交")
 
 	pingDone := make(chan struct{})
 	defer close(pingDone)
@@ -97,12 +97,10 @@ func (c *Client) listenOnce(ctx context.Context, seen map[string]struct{}, handl
 			logNonTradeMessage(data)
 			continue
 		}
-		log.Printf("收到成交消息: payload_count=%d", len(trades))
 
 		for _, trade := range trades {
 			key := TradeKey(trade)
 			if _, exists := seen[key]; exists {
-				log.Printf("跳过重复成交: key=%s", key)
 				continue
 			}
 			seen[key] = struct{}{}
@@ -143,6 +141,10 @@ func pingLoop(conn *websocket.Conn, done <-chan struct{}) {
 }
 
 func logNonTradeMessage(data []byte) {
+	if len(data) == 0 {
+		return
+	}
+
 	var message struct {
 		Topic string `json:"topic"`
 		Type  string `json:"type"`

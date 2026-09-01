@@ -42,6 +42,26 @@ func (r TradeRow) LogString() string {
 	)
 }
 
+func (r TradeRow) BriefString() string {
+	action := r.Side
+	switch r.Side {
+	case "BUY":
+		action = "买入"
+	case "SELL":
+		action = "卖出"
+	}
+
+	return fmt.Sprintf(
+		"%s %s 份，单价 %s，共 %s | %s | %s",
+		action,
+		formatFloat(r.Size, 6),
+		formatFloat(r.Price, 6),
+		formatFloat(r.Notional, 6),
+		nonEmpty(r.Outcome, "-"),
+		nonEmpty(r.MarketTitle, "-"),
+	)
+}
+
 func TradeKey(trade Trade) string {
 	keys := []string{
 		"transactionHash",
@@ -90,6 +110,13 @@ func stringValue(value any) string {
 		return ""
 	}
 	return fmt.Sprint(value)
+}
+
+func nonEmpty(value, fallback string) string {
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	return value
 }
 
 func firstString(trade Trade, keys ...string) string {
