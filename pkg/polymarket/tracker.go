@@ -64,14 +64,55 @@ func logTradeResult(row TradeRow, result TradeProcessResult) {
 	log.Printf("%s | 当前价已同步 %d 条", row.BriefString(), result.PriceUpdated)
 
 	if result.Closed > 0 {
-		log.Printf("平仓更新：关闭 %d 笔买入，已实现盈亏 %s", result.Closed, formatFloat(result.RealizedPNL, 6))
+		logKeyEvent(
+			pnlTitle("平仓", result.RealizedPNL),
+			"关闭 %d 笔买入，已实现盈亏 %s | %s",
+			result.Closed,
+			formatSignedFloat(result.RealizedPNL, 6),
+			row.BriefString(),
+		)
 	}
 
 	if result.RemainingSell > 0 {
-		log.Printf("卖出未匹配：剩余 %s 份没有找到对应买入记录", formatFloat(result.RemainingSell, 6))
+		log.Printf(
+			"卖出未匹配：剩余 %s 份没有找到对应买入记录 | %s",
+			formatFloat(result.RemainingSell, 6),
+			row.BriefString(),
+		)
 	}
 
 	if result.Settled > 0 {
-		log.Printf("结算更新：%d 笔持仓按结算价 %s 完成结算", result.Settled, formatFloat(row.Price, 6))
+		logKeyEvent(
+			pnlTitle("结算", result.SettlementPNL),
+			"%d 笔持仓按结算价 %s 完成结算，最终盈亏 %s | %s",
+			result.Settled,
+			formatFloat(row.Price, 6),
+			formatSignedFloat(result.SettlementPNL, 6),
+			row.BriefString(),
+		)
 	}
+}
+
+func logKeyEvent(title string, format string, args ...any) {
+	log.Printf("========== 关键事件：%s ==========", title)
+	log.Printf(format, args...)
+	log.Println("========================================")
+}
+
+func pnlTitle(prefix string, pnl float64) string {
+	switch {
+	case pnl > 0:
+		return prefix + "赚钱"
+	case pnl < 0:
+		return prefix + "亏钱"
+	default:
+		return prefix + "不赚不亏"
+	}
+}
+
+func formatSignedFloat(value float64, places int) string {
+	if value > 0 {
+		return "+" + formatFloat(value, places)
+	}
+	return formatFloat(value, places)
 }

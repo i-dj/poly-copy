@@ -16,6 +16,7 @@ type TradeProcessResult struct {
 	Inserted      bool
 	PriceUpdated  int64
 	Settled       int64
+	SettlementPNL float64
 	Closed        int
 	RealizedPNL   float64
 	RemainingSell float64
@@ -64,11 +65,12 @@ func (r *TradeRepository) ProcessTrade(ctx context.Context, row TradeRow) (Trade
 	result.PriceUpdated = priceUpdated
 
 	if row.Price == 0 || row.Price == 1 {
-		settled, err := r.settleOpenTrades(ctx, tx, row.AssetID, row.Price)
+		settled, settlementPNL, err := r.settleOpenTrades(ctx, tx, row.AssetID, row.Price)
 		if err != nil {
 			return TradeProcessResult{}, err
 		}
 		result.Settled = settled
+		result.SettlementPNL = settlementPNL
 	}
 
 	if row.Side == "SELL" && row.Wallet != "" && row.AssetID != "" {
@@ -206,42 +208,61 @@ func (r *TradeRepository) updateOpenPrices(ctx context.Context, tx *sql.Tx, asse
 	return result.RowsAffected()
 }
 
-func (r *TradeRepository) settleOpenTrades(ctx context.Context, tx *sql.Tx, assetID string, settlementPrice float64) (int64, error) {
+func (r *TradeRepository) settleOpenTrades(ctx context.Context, tx *sql.Tx, assetID string, settlementPrice float64) (int64, float64, error) {
 	if assetID == "" {
-		return 0, nil
+		return 0, 0, nil
 	}
 
-	result, err := tx.ExecContext(ctx, `
-		UPDATE polymarket_trades
-		SET
-			status = 'SETTLED',
-			close_reason = 'SETTLED',
-			current_price = $1,
-			current_value = remaining_size * $1,
-			unrealized_pnl = 0,
-			unrealized_pnl_pct = 0,
-			close_price = $1,
-			close_value = remaining_size * $1,
-			realized_pnl = COALESCE(realized_pnl, 0) + ((remaining_size * $1) - (remaining_size * price)),
-			realized_pnl_pct = CASE
-				WHEN (size * price) = 0 THEN 0
-				ELSE (COALESCE(realized_pnl, 0) + ((remaining_size * $1) - (remaining_size * price))) / (size * price) * 100
-			END,
-			settlement_price = $1,
-			settled_at = now(),
-			remaining_size = 0,
-			last_price_at = now(),
-			last_checked_at = now(),
-			updated_at = now()
-		WHERE asset_id = $2
-			AND status IN ('OPEN', 'PARTIAL_CLOSED')
-			AND remaining_size > 0
-	`, settlementPrice, assetID)
+	var settled int64
+	var settlementPNL float64
+	err := tx.QueryRowContext(ctx, `
+		WITH candidates AS (
+			SELECT
+				id,
+				size,
+				price,
+				remaining_size,
+				COALESCE(realized_pnl, 0) AS existing_realized_pnl
+			FROM polymarket_trades
+			WHERE asset_id = $2
+				AND status IN ('OPEN', 'PARTIAL_CLOSED')
+				AND remaining_size > 0
+			FOR UPDATE
+		),
+		updated AS (
+			UPDATE polymarket_trades AS t
+			SET
+				status = 'SETTLED',
+				close_reason = 'SETTLED',
+				current_price = $1,
+				current_value = c.remaining_size * $1,
+				unrealized_pnl = 0,
+				unrealized_pnl_pct = 0,
+				close_price = $1,
+				close_value = c.remaining_size * $1,
+				realized_pnl = c.existing_realized_pnl + ((c.remaining_size * $1) - (c.remaining_size * c.price)),
+				realized_pnl_pct = CASE
+					WHEN (c.size * c.price) = 0 THEN 0
+					ELSE (c.existing_realized_pnl + ((c.remaining_size * $1) - (c.remaining_size * c.price))) / (c.size * c.price) * 100
+				END,
+				settlement_price = $1,
+				settled_at = now(),
+				remaining_size = 0,
+				last_price_at = now(),
+				last_checked_at = now(),
+				updated_at = now()
+			FROM candidates AS c
+			WHERE t.id = c.id
+			RETURNING ((c.remaining_size * $1) - (c.remaining_size * c.price)) AS settlement_pnl
+		)
+		SELECT COUNT(*), COALESCE(SUM(settlement_pnl), 0)
+		FROM updated
+	`, settlementPrice, assetID).Scan(&settled, &settlementPNL)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 
-	return result.RowsAffected()
+	return settled, settlementPNL, nil
 }
 
 func (r *TradeRepository) closeBuyTrades(ctx context.Context, tx *sql.Tx, sell TradeRow) (int, float64, float64, error) {
