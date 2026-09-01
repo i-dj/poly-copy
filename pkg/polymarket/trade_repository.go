@@ -686,6 +686,30 @@ func (r *TradeRepository) UpdateCopyOrderError(ctx context.Context, id int64, or
 	return err
 }
 
+func (r *TradeRepository) MarkStalePendingCopyOrdersFailed(ctx context.Context, staleAfter time.Duration) (int64, error) {
+	if staleAfter <= 0 {
+		staleAfter = 2 * time.Minute
+	}
+
+	result, err := r.db.Exec(ctx, `
+		UPDATE copy_orders
+		SET
+			submit_success = false,
+			order_status = 'FAILED',
+			error_message = '订单创建后长时间没有 order_id，可能是进程中断或数据库回写前失败',
+			updated_at = now()
+		WHERE skip_reason IS NULL
+			AND order_id IS NULL
+			AND order_status = 'PENDING'
+			AND detected_at < now() - ($1::text)::interval
+	`, fmt.Sprintf("%f seconds", staleAfter.Seconds()))
+	if err != nil {
+		return 0, err
+	}
+
+	return result.RowsAffected(), nil
+}
+
 func (r *TradeRepository) ListCopyOrdersForSync(ctx context.Context, staleAfter time.Duration, limit int) ([]CopyOrderRow, error) {
 	if staleAfter <= 0 {
 		staleAfter = time.Minute

@@ -731,6 +731,13 @@ func (t *CopyTrader) buildCopyOrder(trade Trade, copySize, copyPrice, copyNotion
 }
 
 func (t *CopyTrader) syncCopyOrders(ctx context.Context, repo *TradeRepository) {
+	failed, err := repo.MarkStalePendingCopyOrdersFailed(ctx, 2*time.Minute)
+	if err != nil {
+		log.Printf("订单修改失败：清理卡住的 PENDING 订单失败 err=%v", err)
+	} else if failed > 0 {
+		logKeyEvent("订单异常", "%d 笔 PENDING 订单长时间没有 order_id，已标记 FAILED", failed)
+	}
+
 	rows, err := repo.ListCopyOrdersForSync(ctx, time.Minute, 100)
 	if err != nil {
 		log.Printf("跟单同步失败：读取 copy_orders 失败 err=%v", err)

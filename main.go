@@ -32,7 +32,7 @@ func main() {
 	settlementInterval := 1 * time.Minute
 	copyWalletInterval := 1 * time.Minute
 	copyWalletLimit := 5
-	copyTraderPollInterval := 3 * time.Second
+	copyTraderPollInterval := 1 * time.Second
 	copyTraderSyncInterval := 1 * time.Minute
 	copyMode := "live"
 	privateKey := mustGetCfg(ctx, db, "POLYMARKET_PRIVATE_KEY")
