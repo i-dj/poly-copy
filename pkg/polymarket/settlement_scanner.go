@@ -2,6 +2,7 @@ package polymarket
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,11 +27,16 @@ type gammaMarket struct {
 	OutcomePrices any    `json:"outcomePrices"`
 }
 
-func runSettlementScanner(ctx context.Context, client *Client, repo *TradeRepository, interval time.Duration) {
+func StartSettlementScanner(ctx context.Context, db *sql.DB, cfg Config, interval time.Duration) {
 	if interval <= 0 {
 		interval = time.Minute
 	}
 
+	cfg.SettlementInterval = interval
+	client := NewClient(cfg)
+	repo := NewTradeRepository(db)
+
+	log.Printf("结算扫描间隔：%s", interval)
 	scanSettlements(ctx, client, repo)
 
 	ticker := time.NewTicker(interval)
@@ -65,8 +71,15 @@ func scanSettlements(ctx context.Context, client *Client, repo *TradeRepository)
 	log.Printf("结算扫描：检查 %d 个未完成资产", len(markets))
 
 	for _, market := range markets {
+		if ctx.Err() != nil {
+			return
+		}
+
 		resolution, err := client.ResolveMarketAsset(ctx, market.ConditionID, market.AssetID)
 		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
 			log.Printf("结算扫描失败：condition_id=%s asset_id=%s err=%v", shortID(market.ConditionID), shortID(market.AssetID), err)
 			continue
 		}

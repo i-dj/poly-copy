@@ -165,6 +165,100 @@ func (r *TradeRepository) SettleAsset(ctx context.Context, assetID string, settl
 	return SettlementResult{Settled: settled, PNL: pnl}, nil
 }
 
+func (r *TradeRepository) ListTopCopyWalletCandidates(ctx context.Context, limit int) ([]CopyWalletCandidate, error) {
+	if limit <= 0 {
+		limit = 5
+	}
+
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT
+			wallet,
+			COUNT(*) AS closed_count,
+			ROUND(SUM(size * price), 6) AS total_cost,
+			ROUND(SUM(realized_pnl), 6) AS net_pnl,
+			ROUND(SUM(realized_pnl) / NULLIF(SUM(size * price), 0) * 100, 2) AS roi_pct,
+			ROUND(SUM(realized_pnl) / NULLIF(SUM(size * price), 0), 6) AS profit_per_usdc,
+			ROUND(
+				COUNT(*) FILTER (WHERE realized_pnl > 0)::numeric / NULLIF(COUNT(*), 0) * 100,
+				2
+			) AS win_rate_pct
+		FROM polymarket_trades
+		WHERE status IN ('CLOSED', 'SETTLED')
+			AND wallet IS NOT NULL
+			AND wallet <> ''
+		GROUP BY wallet
+		HAVING COUNT(*) >= 10
+			AND SUM(size * price) >= 20
+			AND SUM(realized_pnl) > 0
+		ORDER BY profit_per_usdc DESC, net_pnl DESC
+		LIMIT $1
+	`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var candidates []CopyWalletCandidate
+	for rows.Next() {
+		var candidate CopyWalletCandidate
+		if err := rows.Scan(
+			&candidate.Wallet,
+			&candidate.ClosedCount,
+			&candidate.TotalCost,
+			&candidate.NetPNL,
+			&candidate.ROIPct,
+			&candidate.ProfitPerUSDC,
+			&candidate.WinRatePct,
+		); err != nil {
+			return nil, err
+		}
+		candidates = append(candidates, candidate)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return candidates, nil
+}
+
+func (r *TradeRepository) InsertCopyWalletIfMissing(ctx context.Context, wallet string) (bool, error) {
+	if wallet == "" {
+		return false, nil
+	}
+
+	result, err := r.db.ExecContext(ctx, `
+		INSERT INTO copy_wallet (wallet, enable, last_copy_time)
+		SELECT $1, 1, NULL
+		WHERE NOT EXISTS (
+			SELECT 1
+			FROM copy_wallet
+			WHERE wallet = $1
+		)
+	`, wallet)
+	if err != nil {
+		return false, err
+	}
+
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+
+	return affected > 0, nil
+}
+
+func (r *TradeRepository) SyncCopyWalletSequence(ctx context.Context) error {
+	_, err := r.db.ExecContext(ctx, `
+		SELECT setval(
+			pg_get_serial_sequence('copy_wallet', 'id'),
+			COALESCE((SELECT MAX(id) FROM copy_wallet), 0) + 1,
+			false
+		)
+	`)
+	return err
+}
+
 func (r *TradeRepository) insertTrade(ctx context.Context, tx *sql.Tx, row TradeRow) (bool, error) {
 	status := "OPEN"
 	closeReason := sql.NullString{}

@@ -12,8 +12,6 @@ func RunTradeTracker(ctx context.Context, db *sql.DB, cfg Config) error {
 	repo := NewTradeRepository(db)
 
 	log.Printf("启动 Polymarket 成交追踪，MIN_SIZE=%v", cfg.MinSize)
-	log.Printf("结算扫描间隔：%s", cfg.SettlementInterval)
-	go runSettlementScanner(ctx, client, repo, cfg.SettlementInterval)
 
 	err := client.ListenAllTrades(ctx, func(ctx context.Context, trade Trade) error {
 		row, err := client.NormalizeTrade(ctx, trade)
