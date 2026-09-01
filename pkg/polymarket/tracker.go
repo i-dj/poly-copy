@@ -2,12 +2,13 @@ package polymarket
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"log"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-func RunTradeTracker(ctx context.Context, db *sql.DB, cfg Config) error {
+func RunTradeTracker(ctx context.Context, db *pgxpool.Pool, cfg Config) error {
 	client := NewClient(cfg)
 	repo := NewTradeRepository(db)
 

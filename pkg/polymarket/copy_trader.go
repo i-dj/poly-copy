@@ -13,6 +13,8 @@ import (
 	"os/exec"
 	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type CopyTrader struct {
@@ -81,7 +83,7 @@ type orderBookMeta struct {
 	TickSize     float64
 }
 
-func StartCopyTrader(ctx context.Context, db *sql.DB, cfg Config, pollInterval, syncInterval time.Duration) {
+func StartCopyTrader(ctx context.Context, db *pgxpool.Pool, cfg Config, pollInterval, syncInterval time.Duration) {
 	if pollInterval <= 0 {
 		pollInterval = 3 * time.Second
 	}

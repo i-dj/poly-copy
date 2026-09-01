@@ -2,9 +2,10 @@ package polymarket
 
 import (
 	"context"
-	"database/sql"
 	"log"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type CopyWalletCandidate struct {
@@ -17,7 +18,7 @@ type CopyWalletCandidate struct {
 	WinRatePct    float64
 }
 
-func StartCopyWalletSyncer(ctx context.Context, db *sql.DB, interval time.Duration, limit int) {
+func StartCopyWalletSyncer(ctx context.Context, db *pgxpool.Pool, interval time.Duration, limit int) {
 	if interval <= 0 {
 		interval = time.Minute
 	}

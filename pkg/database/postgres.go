@@ -1,7 +1,7 @@
 package database
 
 import (
-	"database/sql"
+	"context"
 	"errors"
 	"fmt"
 	"net/url"
@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
-	_ "github.com/lib/pq"
 )
 
 type Config struct {
@@ -48,25 +48,30 @@ func LoadConfig(envFiles ...string) (Config, error) {
 	return cfg, nil
 }
 
-func NewDB(cfg Config) (*sql.DB, error) {
-	db, err := sql.Open("postgres", cfg.DSN())
+func NewDB(cfg Config) (*pgxpool.Pool, error) {
+	poolCfg, err := pgxpool.ParseConfig(cfg.DSN())
 	if err != nil {
 		return nil, err
 	}
 
-	db.SetMaxOpenConns(getEnvInt("DB_MAX_OPEN_CONNS", 25))
-	db.SetMaxIdleConns(getEnvInt("DB_MAX_IDLE_CONNS", 25))
-	db.SetConnMaxLifetime(time.Duration(getEnvInt("DB_CONN_MAX_LIFETIME_MINUTES", 5)) * time.Minute)
+	poolCfg.MaxConns = int32(getEnvInt("DB_MAX_OPEN_CONNS", 25))
+	poolCfg.MinConns = int32(getEnvInt("DB_MIN_IDLE_CONNS", 2))
+	poolCfg.MaxConnLifetime = time.Duration(getEnvInt("DB_CONN_MAX_LIFETIME_MINUTES", 5)) * time.Minute
 
-	if err := db.Ping(); err != nil {
-		_ = db.Close()
+	db, err := pgxpool.NewWithConfig(context.Background(), poolCfg)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := db.Ping(context.Background()); err != nil {
+		db.Close()
 		return nil, err
 	}
 
 	return db, nil
 }
 
-func Connect(envFiles ...string) (*sql.DB, error) {
+func Connect(envFiles ...string) (*pgxpool.Pool, error) {
 	cfg, err := LoadConfig(envFiles...)
 	if err != nil {
 		return nil, err
@@ -77,12 +82,11 @@ func Connect(envFiles ...string) (*sql.DB, error) {
 
 func (cfg Config) DSN() string {
 	if cfg.URL != "" {
-		return withPQOptions(cfg.URL)
+		return cleanPGXURL(cfg.URL)
 	}
 
 	values := url.Values{}
 	values.Set("sslmode", cfg.SSLMode)
-	values.Set("binary_parameters", "yes")
 
 	return (&url.URL{
 		Scheme:   "postgres",
@@ -93,16 +97,14 @@ func (cfg Config) DSN() string {
 	}).String()
 }
 
-func withPQOptions(rawURL string) string {
+func cleanPGXURL(rawURL string) string {
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
 		return rawURL
 	}
 
 	values := parsed.Query()
-	if values.Get("binary_parameters") == "" {
-		values.Set("binary_parameters", "yes")
-	}
+	values.Del("binary_parameters")
 	parsed.RawQuery = values.Encode()
 
 	return parsed.String()

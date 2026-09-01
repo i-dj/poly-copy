@@ -2,7 +2,6 @@ package polymarket
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type MarketResolution struct {
@@ -27,7 +28,7 @@ type gammaMarket struct {
 	OutcomePrices any    `json:"outcomePrices"`
 }
 
-func StartSettlementScanner(ctx context.Context, db *sql.DB, cfg Config, interval time.Duration) {
+func StartSettlementScanner(ctx context.Context, db *pgxpool.Pool, cfg Config, interval time.Duration) {
 	if interval <= 0 {
 		interval = time.Minute
 	}

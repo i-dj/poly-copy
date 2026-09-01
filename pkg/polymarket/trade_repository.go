@@ -9,10 +9,13 @@ import (
 	"math"
 	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type TradeRepository struct {
-	db *sql.DB
+	db *pgxpool.Pool
 }
 
 type TradeProcessResult struct {
@@ -42,16 +45,16 @@ type openTrade struct {
 	CurrentValue sql.NullFloat64
 }
 
-func NewTradeRepository(db *sql.DB) *TradeRepository {
+func NewTradeRepository(db *pgxpool.Pool) *TradeRepository {
 	return &TradeRepository{db: db}
 }
 
 func (r *TradeRepository) ProcessTrade(ctx context.Context, row TradeRow) (TradeProcessResult, error) {
-	tx, err := r.db.BeginTx(ctx, nil)
+	tx, err := r.db.Begin(ctx)
 	if err != nil {
 		return TradeProcessResult{}, err
 	}
-	defer tx.Rollback()
+	defer tx.Rollback(ctx)
 
 	inserted, err := r.insertTrade(ctx, tx, row)
 	if err != nil {
@@ -62,7 +65,7 @@ func (r *TradeRepository) ProcessTrade(ctx context.Context, row TradeRow) (Trade
 		Inserted: inserted,
 	}
 	if !inserted {
-		if err := tx.Commit(); err != nil {
+		if err := tx.Commit(ctx); err != nil {
 			return TradeProcessResult{}, err
 		}
 		return result, nil
@@ -85,7 +88,7 @@ func (r *TradeRepository) ProcessTrade(ctx context.Context, row TradeRow) (Trade
 		result.RemainingSell = remaining
 	}
 
-	if err := tx.Commit(); err != nil {
+	if err := tx.Commit(ctx); err != nil {
 		return TradeProcessResult{}, err
 	}
 
@@ -97,7 +100,7 @@ func (r *TradeRepository) ListOpenMarkets(ctx context.Context, staleBefore time.
 		limit = 100
 	}
 
-	rows, err := r.db.QueryContext(ctx, `
+	rows, err := r.db.Query(ctx, `
 		SELECT asset_id, condition_id
 		FROM polymarket_trades
 		WHERE status IN ('OPEN', 'PARTIAL_CLOSED')
@@ -137,7 +140,7 @@ func (r *TradeRepository) MarkSettlementChecked(ctx context.Context, assetID str
 		return nil
 	}
 
-	_, err := r.db.ExecContext(ctx, `
+	_, err := r.db.Exec(ctx, `
 		UPDATE polymarket_trades
 		SET
 			last_checked_at = now(),
@@ -150,18 +153,18 @@ func (r *TradeRepository) MarkSettlementChecked(ctx context.Context, assetID str
 }
 
 func (r *TradeRepository) SettleAsset(ctx context.Context, assetID string, settlementPrice float64) (SettlementResult, error) {
-	tx, err := r.db.BeginTx(ctx, nil)
+	tx, err := r.db.Begin(ctx)
 	if err != nil {
 		return SettlementResult{}, err
 	}
-	defer tx.Rollback()
+	defer tx.Rollback(ctx)
 
 	settled, pnl, err := r.settleOpenTrades(ctx, tx, assetID, settlementPrice)
 	if err != nil {
 		return SettlementResult{}, err
 	}
 
-	if err := tx.Commit(); err != nil {
+	if err := tx.Commit(ctx); err != nil {
 		return SettlementResult{}, err
 	}
 
@@ -173,7 +176,7 @@ func (r *TradeRepository) ListTopCopyWalletCandidates(ctx context.Context, limit
 		limit = 5
 	}
 
-	rows, err := r.db.QueryContext(ctx, `
+	rows, err := r.db.Query(ctx, `
 		SELECT
 			wallet,
 			COUNT(*) AS closed_count,
@@ -230,7 +233,7 @@ func (r *TradeRepository) InsertCopyWalletIfMissing(ctx context.Context, wallet 
 		return false, nil
 	}
 
-	result, err := r.db.ExecContext(ctx, `
+	result, err := r.db.Exec(ctx, `
 		INSERT INTO copy_wallet (wallet, enable, last_copy_time)
 		SELECT $1, 1, NULL
 		WHERE NOT EXISTS (
@@ -243,16 +246,11 @@ func (r *TradeRepository) InsertCopyWalletIfMissing(ctx context.Context, wallet 
 		return false, err
 	}
 
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return false, err
-	}
-
-	return affected > 0, nil
+	return result.RowsAffected() > 0, nil
 }
 
 func (r *TradeRepository) SyncCopyWalletSequence(ctx context.Context) error {
-	_, err := r.db.ExecContext(ctx, `
+	_, err := r.db.Exec(ctx, `
 		SELECT setval(
 			pg_get_serial_sequence('copy_wallet', 'id'),
 			COALESCE((SELECT MAX(id) FROM copy_wallet), 0) + 1,
@@ -263,7 +261,7 @@ func (r *TradeRepository) SyncCopyWalletSequence(ctx context.Context) error {
 }
 
 func (r *TradeRepository) ListEnabledCopyWallets(ctx context.Context) ([]CopyWallet, error) {
-	rows, err := r.db.QueryContext(ctx, `
+	rows, err := r.db.Query(ctx, `
 		SELECT wallet, last_copy_time
 		FROM copy_wallet
 		WHERE enable = 1
@@ -297,7 +295,7 @@ func (r *TradeRepository) MarkCopyWalletChecked(ctx context.Context, wallet stri
 		return nil
 	}
 
-	_, err := r.db.ExecContext(ctx, `
+	_, err := r.db.Exec(ctx, `
 		UPDATE copy_wallet
 		SET last_copy_time = now()
 		WHERE wallet = $1
@@ -306,7 +304,7 @@ func (r *TradeRepository) MarkCopyWalletChecked(ctx context.Context, wallet stri
 }
 
 func (r *TradeRepository) GetAvailableCopyPosition(ctx context.Context, assetID string) (float64, error) {
-	rows, err := r.db.QueryContext(ctx, `
+	rows, err := r.db.Query(ctx, `
 		SELECT copy_side, copy_size, matched_size, dry_run, submit_success
 		FROM copy_orders
 		WHERE asset_id = $1
@@ -361,7 +359,7 @@ func (r *TradeRepository) GetAvailableCopyPosition(ctx context.Context, assetID 
 
 func (r *TradeRepository) InsertCopyOrderIfMissing(ctx context.Context, row CopyOrderInsert) (int64, error) {
 	var id int64
-	err := r.db.QueryRowContext(ctx, `
+	err := r.db.QueryRow(ctx, `
 		INSERT INTO copy_orders (
 			source_wallet,
 			source_tx_hash,
@@ -431,14 +429,14 @@ func (r *TradeRepository) InsertCopyOrderIfMissing(ctx context.Context, row Copy
 	if err == nil {
 		return id, nil
 	}
-	if errors.Is(err, sql.ErrNoRows) {
+	if errors.Is(err, pgx.ErrNoRows) {
 		return 0, nil
 	}
 	return 0, err
 }
 
 func (r *TradeRepository) MarkPaperCopyOrderSuccess(ctx context.Context, id int64) error {
-	_, err := r.db.ExecContext(ctx, `
+	_, err := r.db.Exec(ctx, `
 		UPDATE copy_orders
 		SET
 			submit_success = true,
@@ -466,7 +464,7 @@ func (r *TradeRepository) UpdateCopyOrderSuccess(ctx context.Context, id int64, 
 	matchedSize := firstResponseFloat(resp, "size_matched", "matchedSize")
 	filledNotional := firstResponseFloat(resp, "takingAmount", "makingAmount")
 
-	_, err := r.db.ExecContext(ctx, `
+	_, err := r.db.Exec(ctx, `
 		UPDATE copy_orders
 		SET
 			submit_success = true,
@@ -489,7 +487,7 @@ func (r *TradeRepository) UpdateCopyOrderError(ctx context.Context, id int64, or
 		"type":  fmt.Sprintf("%T", orderErr),
 	})
 
-	_, err := r.db.ExecContext(ctx, `
+	_, err := r.db.Exec(ctx, `
 		UPDATE copy_orders
 		SET
 			submit_success = false,
@@ -510,7 +508,7 @@ func (r *TradeRepository) ListCopyOrdersForSync(ctx context.Context, staleAfter 
 		limit = 100
 	}
 
-	rows, err := r.db.QueryContext(ctx, `
+	rows, err := r.db.Query(ctx, `
 		SELECT
 			id,
 			asset_id,
@@ -565,7 +563,7 @@ func (r *TradeRepository) ListCopyOrdersForSync(ctx context.Context, staleAfter 
 }
 
 func (r *TradeRepository) UpdateCopyOrderPNL(ctx context.Context, id int64, orderStatus string, matchedSize float64, copyPrice float64, isFilled bool, isCancelled bool, totalPNL float64) error {
-	_, err := r.db.ExecContext(ctx, `
+	_, err := r.db.Exec(ctx, `
 		UPDATE copy_orders
 		SET
 			order_status = $1,
@@ -582,7 +580,7 @@ func (r *TradeRepository) UpdateCopyOrderPNL(ctx context.Context, id int64, orde
 	return err
 }
 
-func (r *TradeRepository) insertTrade(ctx context.Context, tx *sql.Tx, row TradeRow) (bool, error) {
+func (r *TradeRepository) insertTrade(ctx context.Context, tx pgx.Tx, row TradeRow) (bool, error) {
 	status := "OPEN"
 	closeReason := sql.NullString{}
 	remainingSize := row.Size
@@ -594,7 +592,7 @@ func (r *TradeRepository) insertTrade(ctx context.Context, tx *sql.Tx, row Trade
 	}
 
 	var inserted bool
-	err := tx.QueryRowContext(ctx, `
+	err := tx.QueryRow(ctx, `
 		INSERT INTO polymarket_trades (
 			trade_key,
 			tx_hash,
@@ -664,19 +662,19 @@ func (r *TradeRepository) insertTrade(ctx context.Context, tx *sql.Tx, row Trade
 		return inserted, nil
 	}
 
-	if errors.Is(err, sql.ErrNoRows) {
+	if errors.Is(err, pgx.ErrNoRows) {
 		return false, nil
 	}
 
 	return false, err
 }
 
-func (r *TradeRepository) updateOpenPrices(ctx context.Context, tx *sql.Tx, assetID string, price float64) (int64, error) {
+func (r *TradeRepository) updateOpenPrices(ctx context.Context, tx pgx.Tx, assetID string, price float64) (int64, error) {
 	if assetID == "" {
 		return 0, nil
 	}
 
-	result, err := tx.ExecContext(ctx, `
+	result, err := tx.Exec(ctx, `
 		UPDATE polymarket_trades
 		SET
 			current_price = $1,
@@ -697,17 +695,17 @@ func (r *TradeRepository) updateOpenPrices(ctx context.Context, tx *sql.Tx, asse
 		return 0, err
 	}
 
-	return result.RowsAffected()
+	return result.RowsAffected(), nil
 }
 
-func (r *TradeRepository) settleOpenTrades(ctx context.Context, tx *sql.Tx, assetID string, settlementPrice float64) (int64, float64, error) {
+func (r *TradeRepository) settleOpenTrades(ctx context.Context, tx pgx.Tx, assetID string, settlementPrice float64) (int64, float64, error) {
 	if assetID == "" {
 		return 0, 0, nil
 	}
 
 	var settled int64
 	var settlementPNL float64
-	err := tx.QueryRowContext(ctx, `
+	err := tx.QueryRow(ctx, `
 		WITH candidates AS (
 			SELECT
 				id,
@@ -757,8 +755,8 @@ func (r *TradeRepository) settleOpenTrades(ctx context.Context, tx *sql.Tx, asse
 	return settled, settlementPNL, nil
 }
 
-func (r *TradeRepository) closeBuyTrades(ctx context.Context, tx *sql.Tx, sell TradeRow) (int, float64, float64, error) {
-	rows, err := tx.QueryContext(ctx, `
+func (r *TradeRepository) closeBuyTrades(ctx context.Context, tx pgx.Tx, sell TradeRow) (int, float64, float64, error) {
+	rows, err := tx.Query(ctx, `
 		SELECT
 			id,
 			price,
@@ -819,7 +817,7 @@ func (r *TradeRepository) closeBuyTrades(ctx context.Context, tx *sql.Tx, sell T
 		currentValue := nextRemaining * sell.Price
 		unrealized := currentValue - nextRemaining*buy.Price
 
-		_, err := tx.ExecContext(ctx, `
+		_, err := tx.Exec(ctx, `
 			UPDATE polymarket_trades
 			SET
 				status = $1,

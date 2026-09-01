@@ -2,16 +2,17 @@ package database
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/jackc/pgx/v5"
 )
 
 var ErrCfgNotFound = errors.New("cfg not found")
 
 type QueryRower interface {
-	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+	QueryRow(ctx context.Context, query string, args ...any) pgx.Row
 }
 
 func GetCfgName(ctx context.Context, db QueryRower, cfgKey string) (string, error) {
@@ -21,7 +22,7 @@ func GetCfgName(ctx context.Context, db QueryRower, cfgKey string) (string, erro
 	}
 
 	var cfgName string
-	err := db.QueryRowContext(ctx, `
+	err := db.QueryRow(ctx, `
 		SELECT cfg_name
 		FROM cfg
 		WHERE cfg_key = $1
@@ -31,7 +32,7 @@ func GetCfgName(ctx context.Context, db QueryRower, cfgKey string) (string, erro
 		return cfgName, nil
 	}
 
-	if errors.Is(err, sql.ErrNoRows) {
+	if errors.Is(err, pgx.ErrNoRows) {
 		return "", fmt.Errorf("%w: %s", ErrCfgNotFound, cfgKey)
 	}
 

@@ -43,7 +43,7 @@ func main() {
 		PythonBin:           "python3",
 		LiveOrderScript:     "pkg/polymarket/live_order.py",
 		MinSize:             0,
-		ReconnectDelay:      5 * time.Second,
+		ReconnectDelay:      2 * time.Second,
 		SettlementBatchSize: 100,
 		CopyMode:            copyMode,
 		CopyUSDC:            1,

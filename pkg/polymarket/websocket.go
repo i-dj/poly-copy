@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -12,11 +14,23 @@ import (
 
 type TradeHandler func(context.Context, Trade) error
 
+const (
+	websocketPingInterval      = 10 * time.Second
+	websocketReadTimeout       = 10 * time.Second
+	websocketNoTradeReconnect  = 10 * time.Second
+	websocketForceReconnect    = 10 * time.Minute
+	websocketSeenTrimThreshold = 20000
+	websocketSeenTrimTarget    = 10000
+	websocketMinNotionalFilter = 0
+	websocketMaxMessageBytes   = 20 * 1024 * 1024
+)
+
 func (c *Client) ListenAllTrades(ctx context.Context, handler TradeHandler) error {
 	seen := make(map[string]struct{})
+	log.Println("成交监听规则：过滤 crypto 短周期市场，10 秒无有效成交主动重连，10 分钟强制重连")
 
 	for {
-		log.Println("正在连接 Polymarket WebSocket...")
+		log.Printf("正在连接 Polymarket WebSocket: %s", c.cfg.WSURL)
 		if err := c.listenOnce(ctx, seen, handler); err != nil {
 			if errors.Is(err, context.Canceled) {
 				return err
@@ -34,11 +48,14 @@ func (c *Client) ListenAllTrades(ctx context.Context, handler TradeHandler) erro
 }
 
 func (c *Client) listenOnce(ctx context.Context, seen map[string]struct{}, handler TradeHandler) error {
-	conn, _, err := websocket.DefaultDialer.DialContext(ctx, c.cfg.WSURL, nil)
+	dialer := websocket.DefaultDialer
+	dialer.HandshakeTimeout = websocketReadTimeout
+	conn, _, err := dialer.DialContext(ctx, c.cfg.WSURL, nil)
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
+	conn.SetReadLimit(websocketMaxMessageBytes)
 	log.Println("Polymarket WebSocket 已连接")
 
 	closeDone := make(chan struct{})
@@ -58,19 +75,22 @@ func (c *Client) listenOnce(ctx context.Context, seen map[string]struct{}, handl
 				"topic": "activity",
 				"type":  "trades",
 			},
+			{
+				"topic": "activity",
+				"type":  "orders_matched",
+			},
 		},
 	}); err != nil {
 		return err
 	}
-	log.Println("已订阅全市场实时成交")
+	log.Println("已订阅 activity/trades + activity/orders_matched")
 
 	pingDone := make(chan struct{})
 	defer close(pingDone)
 	go pingLoop(conn, pingDone)
 
-	waitDone := make(chan struct{})
-	defer close(waitDone)
-	go waitLogLoop(waitDone)
+	connectedAt := time.Now()
+	lastTradeAt := time.Now()
 
 	for {
 		select {
@@ -79,55 +99,61 @@ func (c *Client) listenOnce(ctx context.Context, seen map[string]struct{}, handl
 		default:
 		}
 
+		if time.Since(connectedAt) >= websocketForceReconnect {
+			return fmt.Errorf("达到 10 分钟强制重连时间")
+		}
+
+		_ = conn.SetReadDeadline(time.Now().Add(websocketReadTimeout))
 		_, data, err := conn.ReadMessage()
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
+			idle := time.Since(lastTradeAt)
+			if idle >= websocketNoTradeReconnect {
+				log.Printf("%s 无有效成交消息，主动重连", idle.Round(100*time.Millisecond))
+				return fmt.Errorf("10 秒无有效成交，主动重连")
+			}
 			return err
 		}
 
 		raw := string(data)
-		if raw == "ping" || raw == "pong" {
+		if raw == "PING" || raw == "PONG" || raw == "ping" || raw == "pong" {
 			continue
 		}
 
 		trades, ok := parseTradeMessage(data)
 		if !ok {
-			logNonTradeMessage(data)
 			continue
 		}
 
+		gotTrade := false
 		for _, trade := range trades {
-			key := TradeKey(trade)
+			if !isEffectiveMarketTrade(trade) {
+				continue
+			}
+
+			key := websocketTradeKey(trade)
 			if _, exists := seen[key]; exists {
 				continue
 			}
 			seen[key] = struct{}{}
+			trimWebsocketSeen(seen)
 
 			if err := handler(ctx, trade); err != nil {
 				return err
 			}
+			gotTrade = true
 		}
-	}
-}
 
-func waitLogLoop(done <-chan struct{}) {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-done:
-			return
-		case <-ticker.C:
-			log.Println("等待 Polymarket 实时成交推送中...")
+		if gotTrade {
+			lastTradeAt = time.Now()
 		}
 	}
 }
 
 func pingLoop(conn *websocket.Conn, done <-chan struct{}) {
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := time.NewTicker(websocketPingInterval)
 	defer ticker.Stop()
 
 	for {
@@ -135,32 +161,13 @@ func pingLoop(conn *websocket.Conn, done <-chan struct{}) {
 		case <-done:
 			return
 		case <-ticker.C:
-			_ = conn.WriteMessage(websocket.TextMessage, []byte("ping"))
+			deadline := time.Now().Add(5 * time.Second)
+			if err := conn.WriteControl(websocket.PingMessage, nil, deadline); err != nil {
+				log.Printf("心跳失败: %T: %v", err, err)
+				return
+			}
 		}
 	}
-}
-
-func logNonTradeMessage(data []byte) {
-	if len(data) == 0 {
-		return
-	}
-
-	var message struct {
-		Topic string `json:"topic"`
-		Type  string `json:"type"`
-	}
-
-	if err := json.Unmarshal(data, &message); err != nil {
-		log.Printf("收到非 JSON 消息: %s", string(data))
-		return
-	}
-
-	if message.Topic == "" && message.Type == "" {
-		log.Printf("收到非成交消息: %s", string(data))
-		return
-	}
-
-	log.Printf("收到非成交消息: topic=%s type=%s", message.Topic, message.Type)
 }
 
 func parseTradeMessage(data []byte) ([]Trade, bool) {
@@ -188,8 +195,88 @@ func parseTradeMessage(data []byte) ([]Trade, bool) {
 
 	var one Trade
 	if err := json.Unmarshal(message.Payload, &one); err == nil {
+		if one == nil {
+			return nil, false
+		}
 		return []Trade{one}, true
 	}
 
 	return nil, false
+}
+
+func isEffectiveMarketTrade(trade Trade) bool {
+	title := firstString(trade, "title", "market_title", "marketTitle")
+	if isCryptoMarket(title) {
+		return false
+	}
+
+	price := SafeFloat(trade["price"])
+	size := SafeFloat(trade["size"])
+	return price*size >= websocketMinNotionalFilter
+}
+
+func isCryptoMarket(title string) bool {
+	title = strings.ToLower(title)
+	keywords := []string{
+		"bitcoin up or down",
+		"ethereum up or down",
+		"dogecoin up or down",
+		"xrp up or down",
+		"solana up or down",
+		"litecoin up or down",
+		"cardano up or down",
+		"bitcoin above",
+		"ethereum above",
+		"btc updown",
+		"eth updown",
+		"doge updown",
+		"xrp updown",
+		"sol updown",
+		"btc",
+		"eth",
+		"doge",
+		"xrp",
+		"solana",
+		"litecoin",
+		"cardano",
+	}
+
+	for _, keyword := range keywords {
+		if strings.Contains(title, keyword) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func websocketTradeKey(trade Trade) string {
+	txHash := firstString(trade, "transactionHash", "tx_hash", "txHash")
+	wallet := strings.ToLower(firstString(trade, "proxyWallet", "wallet", "maker", "taker"))
+	asset := firstString(trade, "asset", "assetId", "asset_id", "token_id", "tokenID")
+	side := strings.ToUpper(firstString(trade, "side"))
+	size := stringValue(trade["size"])
+	price := stringValue(trade["price"])
+	timestamp := stringValue(trade["timestamp"])
+
+	if txHash != "" {
+		return strings.Join([]string{txHash, wallet, asset, side, size, price}, ":")
+	}
+
+	return strings.Join([]string{wallet, asset, side, size, price, timestamp}, ":")
+}
+
+func trimWebsocketSeen(seen map[string]struct{}) {
+	if len(seen) <= websocketSeenTrimThreshold {
+		return
+	}
+
+	removeCount := len(seen) - websocketSeenTrimTarget
+	for key := range seen {
+		delete(seen, key)
+		removeCount--
+		if removeCount <= 0 {
+			return
+		}
+	}
 }
