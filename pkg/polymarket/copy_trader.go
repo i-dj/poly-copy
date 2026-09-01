@@ -102,9 +102,6 @@ func StartCopyTrader(ctx context.Context, db *pgxpool.Pool, cfg Config, pollInte
 	if cfg.CopyTradeLimit <= 0 {
 		cfg.CopyTradeLimit = 10
 	}
-	if cfg.MinSourceNotional <= 0 {
-		cfg.MinSourceNotional = 20
-	}
 	if cfg.MinCopyPrice <= 0 {
 		cfg.MinCopyPrice = 0.05
 	}
@@ -128,10 +125,9 @@ func StartCopyTrader(ctx context.Context, db *pgxpool.Pool, cfg Config, pollInte
 	repo := NewTradeRepository(db)
 
 	log.Printf(
-		"跟单程序启动：mode=%s max_copy_usdc=%s min_source_notional=%s price_range=%s-%s skip_up_down=%t poll=%s sync=%s",
+		"跟单程序启动：mode=%s max_copy_usdc=%s source_min=不限制 price_range=%s-%s skip_up_down=%t poll=%s sync=%s",
 		strings.ToLower(cfg.CopyMode),
 		formatFloat(trader.maxCopyUSDC(), 6),
-		formatFloat(cfg.MinSourceNotional, 6),
 		formatFloat(cfg.MinCopyPrice, 6),
 		formatFloat(cfg.MaxCopyPrice, 6),
 		cfg.SkipUpDownMarkets,
@@ -296,8 +292,6 @@ func (t *CopyTrader) handleTrade(ctx context.Context, repo *TradeRepository, tra
 		skipReason = "PRICE_INVALID"
 	} else if sourceNotional <= 0 {
 		skipReason = "SOURCE_NOTIONAL_INVALID"
-	} else if sourceNotional < t.cfg.MinSourceNotional {
-		skipReason = "SOURCE_NOTIONAL_BELOW_MIN"
 	} else if price < t.cfg.MinCopyPrice || price > t.cfg.MaxCopyPrice {
 		skipReason = "PRICE_OUT_OF_RANGE"
 	} else if t.cfg.SkipUpDownMarkets && isUpDownMarket(trade) {
@@ -348,14 +342,13 @@ func (t *CopyTrader) handleTrade(ctx context.Context, repo *TradeRepository, tra
 	}
 
 	if skipReason != "" {
-		log.Printf("跟单跳过：db_id=%d reason=%s | 源订单 %s %s 份，单价 %s，共 %s | 过滤条件 min_source=%s price_range=%s-%s | %s | %s",
+		log.Printf("跟单跳过：db_id=%d reason=%s | 源订单 %s %s 份，单价 %s，共 %s | 过滤条件 price_range=%s-%s | %s | %s",
 			dbID,
 			skipReason,
 			side,
 			formatFloat(row.SourceSize, 6),
 			formatFloat(price, 6),
 			formatFloat(sourceNotional, 6),
-			formatFloat(t.cfg.MinSourceNotional, 6),
 			formatFloat(t.cfg.MinCopyPrice, 6),
 			formatFloat(t.cfg.MaxCopyPrice, 6),
 			nonEmpty(row.Outcome, "-"),

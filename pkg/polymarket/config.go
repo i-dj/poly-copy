@@ -19,7 +19,6 @@ type Config struct {
 	CopyUSDC            float64
 	MinCopyUSDC         float64
 	CopyTradeLimit      int
-	MinSourceNotional   float64
 	MinCopyPrice        float64
 	MaxCopyPrice        float64
 	SkipUpDownMarkets   bool
