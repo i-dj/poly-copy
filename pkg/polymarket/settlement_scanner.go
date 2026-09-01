@@ -101,7 +101,7 @@ func scanSettlements(ctx context.Context, client *Client, repo *TradeRepository)
 
 		logKeyEvent(
 			pnlTitle("结算", result.PNL),
-			"%d 笔持仓已按官方市场状态结算，结算价 %s，最终盈亏 %s | asset=%s condition=%s",
+			"持仓=%d 笔，结算价=%s，盈亏=%s | asset=%s condition=%s",
 			result.Settled,
 			formatFloat(resolution.SettlementPrice, 6),
 			formatSignedFloat(result.PNL, 6),

@@ -3,6 +3,7 @@ package polymarket
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -60,7 +61,7 @@ func logTradeResult(row TradeRow, result TradeProcessResult) {
 	if result.Closed > 0 {
 		logKeyEvent(
 			pnlTitle("平仓", result.RealizedPNL),
-			"关闭 %d 笔买入，已实现盈亏 %s | %s",
+			"关闭=%d 笔，盈亏=%s | %s",
 			result.Closed,
 			formatSignedFloat(result.RealizedPNL, 6),
 			row.BriefString(),
@@ -74,9 +75,7 @@ func logTradeResult(row TradeRow, result TradeProcessResult) {
 }
 
 func logKeyEvent(title string, format string, args ...any) {
-	log.Printf("********** 关键事件：%s **********", title)
-	log.Printf(format, args...)
-	log.Println("****************************************")
+	log.Printf("%s：%s", title, fmt.Sprintf(format, args...))
 }
 
 func pnlTitle(prefix string, pnl float64) string {

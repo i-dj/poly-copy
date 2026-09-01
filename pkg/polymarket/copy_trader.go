@@ -435,17 +435,17 @@ func (t *CopyTrader) handleTrade(ctx context.Context, repo *TradeRepository, tra
 	}
 
 	logKeyEvent(
-		"跟单准备下单",
-		"db_id=%d trader=%s 源订单金额 %s，跟单金额封顶 %s | %s %s 份，源价 %s，下单价 %s，共 %s，订单类型 IOC | %s | %s",
+		"下单【提交】",
+		"db_id=%d 方向=%s 数量=%s 单价=%s 总金额=%s 结果=提交中 | trader=%s 源金额=%s 封顶=%s 源价=%s 类型=IOC | %s | %s",
 		dbID,
+		side,
+		formatFloat(copySize, 6),
+		formatFloat(copyPrice, 6),
+		formatFloat(copyNotional, 6),
 		row.SourceWallet,
 		formatFloat(sourceNotional, 6),
 		formatFloat(t.maxCopyUSDC(), 6),
-		side,
-		formatFloat(copySize, 6),
 		formatFloat(sourcePrice, 6),
-		formatFloat(copyPrice, 6),
-		formatFloat(copyNotional, 6),
 		nonEmpty(row.Outcome, "-"),
 		nonEmpty(row.MarketTitle, "-"),
 	)
@@ -466,13 +466,13 @@ func (t *CopyTrader) handleTrade(ctx context.Context, repo *TradeRepository, tra
 			log.Printf("live 跟单失败后更新订单失败：db_id=%d err=%v", dbID, updateErr)
 			return
 		}
-		logKeyEvent("下单失败", "db_id=%d %s %s 份，单价 %s，共 %s | 失败原因=%v",
+		logKeyEvent("下单【失败】", "db_id=%d 方向=%s 数量=%s 单价=%s 总金额=%s 结果=失败 | 原因=%s",
 			dbID,
 			row.CopySide,
 			formatFloat(row.CopySize, 6),
 			formatFloat(row.CopyPrice, 6),
 			formatFloat(row.CopyNotional, 6),
-			err,
+			oneLine(err.Error(), 240),
 		)
 		return
 	}
@@ -487,13 +487,13 @@ func (t *CopyTrader) handleTrade(ctx context.Context, repo *TradeRepository, tra
 		)
 		return
 	}
-	logKeyEvent("下单成功", "db_id=%d %s %s 份，单价 %s，共 %s | order_response=%s",
+	logKeyEvent("下单【成功】", "db_id=%d 方向=%s 数量=%s 单价=%s 总金额=%s 结果=成功 | %s",
 		dbID,
 		row.CopySide,
 		formatFloat(row.CopySize, 6),
 		formatFloat(row.CopyPrice, 6),
 		formatFloat(row.CopyNotional, 6),
-		string(resp),
+		orderResponseBrief(resp),
 	)
 }
 
@@ -939,6 +939,37 @@ func (t *CopyTrader) maxCopyUSDC() float64 {
 
 func isContextDone(ctx context.Context, err error) bool {
 	return ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+func orderResponseBrief(resp []byte) string {
+	var data map[string]any
+	if err := json.Unmarshal(resp, &data); err != nil {
+		return "响应=" + oneLine(string(resp), 160)
+	}
+
+	parts := []string{}
+	if orderID := firstResponseString(data, "orderID", "orderId", "id"); orderID != "" {
+		parts = append(parts, "order_id="+shortID(orderID))
+	}
+	if status := firstResponseString(data, "status", "order_status"); status != "" {
+		parts = append(parts, "status="+status)
+	}
+	if orderType := firstResponseString(data, "effectiveOrderType"); orderType != "" {
+		parts = append(parts, "实际类型="+orderType)
+	}
+	if len(parts) == 0 {
+		return "响应=已返回"
+	}
+
+	return strings.Join(parts, " ")
+}
+
+func oneLine(value string, limit int) string {
+	value = strings.Join(strings.Fields(value), " ")
+	if limit > 0 && len(value) > limit {
+		return value[:limit] + "..."
+	}
+	return value
 }
 
 func (t *CopyTrader) copyNotionalForSource(sourceNotional float64) float64 {
