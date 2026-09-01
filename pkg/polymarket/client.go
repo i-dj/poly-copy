@@ -4,16 +4,24 @@ import (
 	"context"
 	"encoding/json"
 	"math"
+	"net/http"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type Client struct {
-	cfg Config
+	cfg  Config
+	http *http.Client
 }
 
 func NewClient(cfg Config) *Client {
-	return &Client{cfg: cfg}
+	return &Client{
+		cfg: cfg,
+		http: &http.Client{
+			Timeout: 10 * time.Second,
+		},
+	}
 }
 
 func (c *Client) NormalizeTrade(ctx context.Context, trade Trade) (TradeRow, error) {

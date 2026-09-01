@@ -15,11 +15,19 @@ type TradeRepository struct {
 type TradeProcessResult struct {
 	Inserted      bool
 	PriceUpdated  int64
-	Settled       int64
-	SettlementPNL float64
 	Closed        int
 	RealizedPNL   float64
 	RemainingSell float64
+}
+
+type OpenMarket struct {
+	AssetID     string
+	ConditionID string
+}
+
+type SettlementResult struct {
+	Settled int64
+	PNL     float64
 }
 
 type openTrade struct {
@@ -64,15 +72,6 @@ func (r *TradeRepository) ProcessTrade(ctx context.Context, row TradeRow) (Trade
 
 	result.PriceUpdated = priceUpdated
 
-	if row.Price == 0 || row.Price == 1 {
-		settled, settlementPNL, err := r.settleOpenTrades(ctx, tx, row.AssetID, row.Price)
-		if err != nil {
-			return TradeProcessResult{}, err
-		}
-		result.Settled = settled
-		result.SettlementPNL = settlementPNL
-	}
-
 	if row.Side == "SELL" && row.Wallet != "" && row.AssetID != "" {
 		closed, realized, remaining, err := r.closeBuyTrades(ctx, tx, row)
 		if err != nil {
@@ -88,6 +87,82 @@ func (r *TradeRepository) ProcessTrade(ctx context.Context, row TradeRow) (Trade
 	}
 
 	return result, nil
+}
+
+func (r *TradeRepository) ListOpenMarkets(ctx context.Context, staleBefore time.Time, limit int) ([]OpenMarket, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT asset_id, condition_id
+		FROM polymarket_trades
+		WHERE status IN ('OPEN', 'PARTIAL_CLOSED')
+			AND remaining_size > 0
+			AND asset_id IS NOT NULL
+			AND asset_id <> ''
+			AND condition_id IS NOT NULL
+			AND condition_id <> ''
+		GROUP BY asset_id, condition_id
+		HAVING MIN(last_checked_at) IS NULL OR MIN(last_checked_at) < $1
+		ORDER BY MIN(last_checked_at) ASC NULLS FIRST, condition_id, asset_id
+		LIMIT $2
+	`, staleBefore, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var markets []OpenMarket
+	for rows.Next() {
+		var market OpenMarket
+		if err := rows.Scan(&market.AssetID, &market.ConditionID); err != nil {
+			return nil, err
+		}
+		markets = append(markets, market)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return markets, nil
+}
+
+func (r *TradeRepository) MarkSettlementChecked(ctx context.Context, assetID string) error {
+	if assetID == "" {
+		return nil
+	}
+
+	_, err := r.db.ExecContext(ctx, `
+		UPDATE polymarket_trades
+		SET
+			last_checked_at = now(),
+			updated_at = now()
+		WHERE asset_id = $1
+			AND status IN ('OPEN', 'PARTIAL_CLOSED')
+			AND remaining_size > 0
+	`, assetID)
+	return err
+}
+
+func (r *TradeRepository) SettleAsset(ctx context.Context, assetID string, settlementPrice float64) (SettlementResult, error) {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return SettlementResult{}, err
+	}
+	defer tx.Rollback()
+
+	settled, pnl, err := r.settleOpenTrades(ctx, tx, assetID, settlementPrice)
+	if err != nil {
+		return SettlementResult{}, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return SettlementResult{}, err
+	}
+
+	return SettlementResult{Settled: settled, PNL: pnl}, nil
 }
 
 func (r *TradeRepository) insertTrade(ctx context.Context, tx *sql.Tx, row TradeRow) (bool, error) {
@@ -134,7 +209,7 @@ func (r *TradeRepository) insertTrade(ctx context.Context, tx *sql.Tx, row Trade
 			updated_at
 		)
 		VALUES (
-			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb,
 			$14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25,
 			now(), now(), now()
 		)
@@ -153,7 +228,7 @@ func (r *TradeRepository) insertTrade(ctx context.Context, tx *sql.Tx, row Trade
 		row.Price,
 		row.Notional,
 		nullTime(row.TradeTime),
-		row.RawTrade,
+		string(row.RawTrade),
 		status,
 		closeReason,
 		remainingSize,
@@ -286,35 +361,46 @@ func (r *TradeRepository) closeBuyTrades(ctx context.Context, tx *sql.Tx, sell T
 	if err != nil {
 		return 0, 0, sell.Size, err
 	}
-	defer rows.Close()
+
+	var buys []openTrade
+
+	for rows.Next() {
+		open := openTrade{}
+		if err := rows.Scan(&open.ID, &open.Price, &open.Remaining, &open.RealizedPNL, &open.CloseValue, &open.CurrentValue); err != nil {
+			rows.Close()
+			return 0, 0, sell.Size, err
+		}
+		buys = append(buys, open)
+	}
+
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, 0, sell.Size, err
+	}
+	rows.Close()
 
 	remainingSell := sell.Size
 	closed := 0
 	totalRealized := 0.0
 
-	for rows.Next() {
+	for _, buy := range buys {
 		if remainingSell <= 0 {
 			break
 		}
 
-		open := openTrade{}
-		if err := rows.Scan(&open.ID, &open.Price, &open.Remaining, &open.RealizedPNL, &open.CloseValue, &open.CurrentValue); err != nil {
-			return closed, totalRealized, remainingSell, err
-		}
-
-		closeSize := math.Min(open.Remaining, remainingSell)
-		realized := closeSize * (sell.Price - open.Price)
-		nextRemaining := open.Remaining - closeSize
+		closeSize := math.Min(buy.Remaining, remainingSell)
+		realized := closeSize * (sell.Price - buy.Price)
+		nextRemaining := buy.Remaining - closeSize
 		nextStatus := "PARTIAL_CLOSED"
 		if nextRemaining <= 0.000000000001 {
 			nextRemaining = 0
 			nextStatus = "CLOSED"
 		}
 
-		nextRealized := nullFloatValue(open.RealizedPNL) + realized
-		nextCloseValue := nullFloatValue(open.CloseValue) + closeSize*sell.Price
+		nextRealized := nullFloatValue(buy.RealizedPNL) + realized
+		nextCloseValue := nullFloatValue(buy.CloseValue) + closeSize*sell.Price
 		currentValue := nextRemaining * sell.Price
-		unrealized := currentValue - nextRemaining*open.Price
+		unrealized := currentValue - nextRemaining*buy.Price
 
 		_, err := tx.ExecContext(ctx, `
 			UPDATE polymarket_trades
@@ -341,7 +427,7 @@ func (r *TradeRepository) closeBuyTrades(ctx context.Context, tx *sql.Tx, sell T
 				last_checked_at = now(),
 				updated_at = now()
 			WHERE id = $9
-		`, nextStatus, nextRemaining, sell.Price, currentValue, unrealized, nextCloseValue, sell.TxHash, nextRealized, open.ID)
+		`, nextStatus, nextRemaining, sell.Price, currentValue, unrealized, nextCloseValue, sell.TxHash, nextRealized, buy.ID)
 		if err != nil {
 			return closed, totalRealized, remainingSell, err
 		}
@@ -349,10 +435,6 @@ func (r *TradeRepository) closeBuyTrades(ctx context.Context, tx *sql.Tx, sell T
 		closed++
 		totalRealized += realized
 		remainingSell -= closeSize
-	}
-
-	if err := rows.Err(); err != nil {
-		return closed, totalRealized, remainingSell, err
 	}
 
 	return closed, totalRealized, remainingSell, nil

@@ -24,9 +24,12 @@ func main() {
 	log.Println("数据库连接成功")
 
 	cfg := polymarket.Config{
-		WSURL:          "wss://ws-live-data.polymarket.com",
-		MinSize:        0,
-		ReconnectDelay: 5 * time.Second,
+		WSURL:               "wss://ws-live-data.polymarket.com",
+		GammaMarketsURL:     "https://gamma-api.polymarket.com/markets",
+		MinSize:             0,
+		ReconnectDelay:      5 * time.Second,
+		SettlementInterval:  1 * time.Minute,
+		SettlementBatchSize: 100,
 	}
 
 	if err := polymarket.RunTradeTracker(ctx, db, cfg); err != nil {

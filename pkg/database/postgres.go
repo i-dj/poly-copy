@@ -77,11 +77,12 @@ func Connect(envFiles ...string) (*sql.DB, error) {
 
 func (cfg Config) DSN() string {
 	if cfg.URL != "" {
-		return cfg.URL
+		return withPQOptions(cfg.URL)
 	}
 
 	values := url.Values{}
 	values.Set("sslmode", cfg.SSLMode)
+	values.Set("binary_parameters", "yes")
 
 	return (&url.URL{
 		Scheme:   "postgres",
@@ -90,6 +91,21 @@ func (cfg Config) DSN() string {
 		Path:     cfg.DBName,
 		RawQuery: values.Encode(),
 	}).String()
+}
+
+func withPQOptions(rawURL string) string {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL
+	}
+
+	values := parsed.Query()
+	if values.Get("binary_parameters") == "" {
+		values.Set("binary_parameters", "yes")
+	}
+	parsed.RawQuery = values.Encode()
+
+	return parsed.String()
 }
 
 func getEnv(key, fallback string) string {
