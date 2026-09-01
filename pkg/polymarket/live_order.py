@@ -22,6 +22,7 @@ def main():
     side_text = str(req["side"]).upper()
     price = float(req["price"])
     size = float(req["size"])
+    order_type_text = str(req.get("order_type") or "IOC").upper()
 
     if side_text not in ("BUY", "SELL"):
         raise RuntimeError(f"unsupported side: {side_text}")
@@ -63,7 +64,8 @@ def main():
         options=PartialCreateOrderOptions(tick_size=tick_size, neg_risk=neg_risk),
     )
 
-    resp = client.post_order(signed_order, OrderType.GTC)
+    order_type = OrderType.IOC if order_type_text == "IOC" else OrderType.GTC
+    resp = client.post_order(signed_order, order_type)
     print(json.dumps(resp, ensure_ascii=False), flush=True)
 
 

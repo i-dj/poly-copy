@@ -56,8 +56,9 @@ func main() {
 		CopyUSDC:            1,
 		MinCopyUSDC:         5,
 		CopyTradeLimit:      10,
-		MinCopyPrice:        0.05,
-		MaxCopyPrice:        0.95,
+		CopyPriceOffset:     0.01,
+		MinCopyPrice:        0.001,
+		MaxCopyPrice:        0.999,
 		SkipUpDownMarkets:   true,
 	}
 
