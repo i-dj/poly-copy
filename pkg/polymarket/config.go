@@ -9,6 +9,9 @@ type Config struct {
 	DataAPITradesURL    string
 	PrivateKey          string
 	FunderAddress       string
+	CLOBAPIKey          string
+	CLOBAPISecret       string
+	CLOBAPIPassphrase   string
 	PythonBin           string
 	LiveOrderScript     string
 	BalanceScript       string

@@ -74,6 +74,9 @@ type liveOrderRequest struct {
 	ChainID       int     `json:"chain_id"`
 	PrivateKey    string  `json:"private_key"`
 	FunderAddress string  `json:"funder_address"`
+	APIKey        string  `json:"api_key,omitempty"`
+	APISecret     string  `json:"api_secret,omitempty"`
+	APIPassphrase string  `json:"api_passphrase,omitempty"`
 	TokenID       string  `json:"token_id"`
 	Side          string  `json:"side"`
 	Price         float64 `json:"price"`
@@ -86,6 +89,9 @@ type walletBalanceRequest struct {
 	ChainID       int    `json:"chain_id"`
 	PrivateKey    string `json:"private_key"`
 	FunderAddress string `json:"funder_address"`
+	APIKey        string `json:"api_key,omitempty"`
+	APISecret     string `json:"api_secret,omitempty"`
+	APIPassphrase string `json:"api_passphrase,omitempty"`
 }
 
 type orderStatusRequest struct {
@@ -93,6 +99,9 @@ type orderStatusRequest struct {
 	ChainID       int    `json:"chain_id"`
 	PrivateKey    string `json:"private_key"`
 	FunderAddress string `json:"funder_address"`
+	APIKey        string `json:"api_key,omitempty"`
+	APISecret     string `json:"api_secret,omitempty"`
+	APIPassphrase string `json:"api_passphrase,omitempty"`
 	OrderID       string `json:"order_id"`
 }
 
@@ -494,6 +503,9 @@ func (t *CopyTrader) submitLiveOrder(ctx context.Context, row CopyOrderInsert) (
 		ChainID:       137,
 		PrivateKey:    t.cfg.PrivateKey,
 		FunderAddress: t.cfg.FunderAddress,
+		APIKey:        t.cfg.CLOBAPIKey,
+		APISecret:     t.cfg.CLOBAPISecret,
+		APIPassphrase: t.cfg.CLOBAPIPassphrase,
 		TokenID:       row.AssetID,
 		Side:          row.CopySide,
 		Price:         row.CopyPrice,
@@ -544,6 +556,9 @@ func (t *CopyTrader) fetchWalletBalance(ctx context.Context) ([]byte, error) {
 		ChainID:       137,
 		PrivateKey:    t.cfg.PrivateKey,
 		FunderAddress: t.cfg.FunderAddress,
+		APIKey:        t.cfg.CLOBAPIKey,
+		APISecret:     t.cfg.CLOBAPISecret,
+		APIPassphrase: t.cfg.CLOBAPIPassphrase,
 	})
 	if err != nil {
 		return nil, err
@@ -592,6 +607,9 @@ func (t *CopyTrader) fetchLiveOrderStatus(ctx context.Context, orderID string) (
 		ChainID:       137,
 		PrivateKey:    t.cfg.PrivateKey,
 		FunderAddress: t.cfg.FunderAddress,
+		APIKey:        t.cfg.CLOBAPIKey,
+		APISecret:     t.cfg.CLOBAPISecret,
+		APIPassphrase: t.cfg.CLOBAPIPassphrase,
 		OrderID:       orderID,
 	})
 	if err != nil {
