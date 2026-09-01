@@ -76,6 +76,11 @@ type liveOrderRequest struct {
 	Size          float64 `json:"size"`
 }
 
+type orderBookMeta struct {
+	MinOrderSize float64
+	TickSize     float64
+}
+
 func StartCopyTrader(ctx context.Context, db *sql.DB, cfg Config, pollInterval, syncInterval time.Duration) {
 	if pollInterval <= 0 {
 		pollInterval = 3 * time.Second
@@ -295,6 +300,24 @@ func (t *CopyTrader) handleTrade(ctx context.Context, repo *TradeRepository, tra
 
 	copyNotional := roundFloat(copySize*price, 6)
 	row := t.buildCopyOrder(trade, copySize, price, copyNotional, skipReason)
+
+	if skipReason == "" {
+		meta, err := t.fetchOrderBookMeta(ctx, assetID)
+		if err != nil {
+			skipReason = "MARKET_NOT_TRADABLE"
+			row = t.buildCopyOrder(trade, 0, price, 0, skipReason)
+			log.Printf("跟单跳过：市场暂不可交易 asset=%s err=%v | %s | %s", shortID(assetID), err, nonEmpty(row.Outcome, "-"), nonEmpty(row.MarketTitle, "-"))
+		} else if meta.MinOrderSize > 0 && copySize < meta.MinOrderSize {
+			skipReason = "COPY_SIZE_BELOW_MIN_ORDER_SIZE"
+			row = t.buildCopyOrder(trade, 0, price, 0, skipReason)
+			log.Printf("跟单跳过：copy_size %s 小于市场最小下单数量 %s | %s | %s",
+				formatFloat(copySize, 6),
+				formatFloat(meta.MinOrderSize, 6),
+				nonEmpty(row.Outcome, "-"),
+				nonEmpty(row.MarketTitle, "-"),
+			)
+		}
+	}
 
 	dbID, err := repo.InsertCopyOrderIfMissing(ctx, row)
 	if err != nil {
@@ -543,6 +566,42 @@ func (t *CopyTrader) getCurrentExitPrice(ctx context.Context, assetID string) fl
 	}
 
 	return SafeFloat(data["price"])
+}
+
+func (t *CopyTrader) fetchOrderBookMeta(ctx context.Context, assetID string) (orderBookMeta, error) {
+	endpoint, err := url.Parse(strings.TrimRight(t.cfg.CLOBURL, "/") + "/book")
+	if err != nil {
+		return orderBookMeta{}, err
+	}
+
+	values := endpoint.Query()
+	values.Set("token_id", assetID)
+	endpoint.RawQuery = values.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
+	if err != nil {
+		return orderBookMeta{}, err
+	}
+
+	resp, err := t.httpClient.Do(req)
+	if err != nil {
+		return orderBookMeta{}, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return orderBookMeta{}, fmt.Errorf("orderbook 不可用: %s", resp.Status)
+	}
+
+	var data map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return orderBookMeta{}, err
+	}
+
+	return orderBookMeta{
+		MinOrderSize: SafeFloat(data["min_order_size"]),
+		TickSize:     SafeFloat(data["tick_size"]),
+	}, nil
 }
 
 func (t *CopyTrader) calcSize(price float64, notional float64) float64 {
