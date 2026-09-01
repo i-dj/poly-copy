@@ -55,7 +55,6 @@ func syncCopyWallets(ctx context.Context, repo *TradeRepository, limit int) {
 		return
 	}
 
-	insertedCount := 0
 	for _, candidate := range candidates {
 		inserted, err := repo.InsertCopyWalletIfMissing(ctx, candidate.Wallet)
 		if err != nil {
@@ -64,7 +63,6 @@ func syncCopyWallets(ctx context.Context, repo *TradeRepository, limit int) {
 		}
 
 		if inserted {
-			insertedCount++
 			logKeyEvent(
 				"新增跟单钱包",
 				"wallet=%s | 净赚 %s，ROI %s%%，胜率 %s%%，成交 %d 笔，成本 %s",
@@ -77,6 +75,4 @@ func syncCopyWallets(ctx context.Context, repo *TradeRepository, limit int) {
 			)
 		}
 	}
-
-	log.Printf("跟单钱包刷新完成：候选 %d 个，新增 %d 个", len(candidates), insertedCount)
 }

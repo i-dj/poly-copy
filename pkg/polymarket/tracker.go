@@ -21,22 +21,18 @@ func RunTradeTracker(ctx context.Context, db *pgxpool.Pool, cfg Config) error {
 		}
 
 		if row.Wallet == "" {
-			log.Printf("跳过成交：缺少钱包地址 | %s", row.BriefString())
 			return nil
 		}
 
 		if row.AssetID == "" {
-			log.Printf("跳过成交：缺少资产 ID | %s", row.BriefString())
 			return nil
 		}
 
 		if row.Side != "BUY" && row.Side != "SELL" {
-			log.Printf("跳过成交：不支持方向 %s | %s", row.Side, row.BriefString())
 			return nil
 		}
 
 		if row.Size < cfg.MinSize {
-			log.Printf("跳过成交：数量 %s 小于 MIN_SIZE=%v | %s", formatFloat(row.Size, 6), cfg.MinSize, row.BriefString())
 			return nil
 		}
 
@@ -58,11 +54,8 @@ func RunTradeTracker(ctx context.Context, db *pgxpool.Pool, cfg Config) error {
 
 func logTradeResult(row TradeRow, result TradeProcessResult) {
 	if !result.Inserted {
-		log.Printf("重复成交，已忽略 | %s", row.BriefString())
 		return
 	}
-
-	log.Printf("%s | 当前价已同步 %d 条", row.BriefString(), result.PriceUpdated)
 
 	if result.Closed > 0 {
 		logKeyEvent(
@@ -75,19 +68,15 @@ func logTradeResult(row TradeRow, result TradeProcessResult) {
 	}
 
 	if result.RemainingSell > 0 {
-		log.Printf(
-			"卖出未匹配：剩余 %s 份没有找到对应买入记录 | %s",
-			formatFloat(result.RemainingSell, 6),
-			row.BriefString(),
-		)
+		return
 	}
 
 }
 
 func logKeyEvent(title string, format string, args ...any) {
-	log.Printf("========== 关键事件：%s ==========", title)
+	log.Printf("********** 关键事件：%s **********", title)
 	log.Printf(format, args...)
-	log.Println("========================================")
+	log.Println("****************************************")
 }
 
 func pnlTitle(prefix string, pnl float64) string {

@@ -65,11 +65,8 @@ func scanSettlements(ctx context.Context, client *Client, repo *TradeRepository)
 	}
 
 	if len(markets) == 0 {
-		log.Println("结算扫描：没有未完成持仓")
 		return
 	}
-
-	log.Printf("结算扫描：检查 %d 个未完成资产", len(markets))
 
 	for _, market := range markets {
 		if ctx.Err() != nil {

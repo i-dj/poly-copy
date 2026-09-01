@@ -11,6 +11,7 @@ type Config struct {
 	FunderAddress       string
 	PythonBin           string
 	LiveOrderScript     string
+	BalanceScript       string
 	MinSize             float64
 	ReconnectDelay      time.Duration
 	SettlementInterval  time.Duration

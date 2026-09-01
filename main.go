@@ -42,6 +42,7 @@ func main() {
 		FunderAddress:       funderAddress,
 		PythonBin:           "python3",
 		LiveOrderScript:     "pkg/polymarket/live_order.py",
+		BalanceScript:       "pkg/polymarket/wallet_balance.py",
 		MinSize:             0,
 		ReconnectDelay:      2 * time.Second,
 		SettlementBatchSize: 100,

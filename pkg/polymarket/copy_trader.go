@@ -18,10 +18,11 @@ import (
 )
 
 type CopyTrader struct {
-	cfg        Config
-	httpClient *http.Client
-	seen       map[string]struct{}
-	lastSync   time.Time
+	cfg            Config
+	httpClient     *http.Client
+	seen           map[string]struct{}
+	lastSync       time.Time
+	lastBalanceLog time.Time
 }
 
 type CopyWallet struct {
@@ -78,10 +79,19 @@ type liveOrderRequest struct {
 	Size          float64 `json:"size"`
 }
 
+type walletBalanceRequest struct {
+	Host          string `json:"host"`
+	ChainID       int    `json:"chain_id"`
+	PrivateKey    string `json:"private_key"`
+	FunderAddress string `json:"funder_address"`
+}
+
 type orderBookMeta struct {
 	MinOrderSize float64
 	TickSize     float64
 }
+
+const walletBalanceLogInterval = 5 * time.Minute
 
 func StartCopyTrader(ctx context.Context, db *pgxpool.Pool, cfg Config, pollInterval, syncInterval time.Duration) {
 	if pollInterval <= 0 {
@@ -113,6 +123,9 @@ func StartCopyTrader(ctx context.Context, db *pgxpool.Pool, cfg Config, pollInte
 	}
 	if cfg.LiveOrderScript == "" {
 		cfg.LiveOrderScript = "pkg/polymarket/live_order.py"
+	}
+	if cfg.BalanceScript == "" {
+		cfg.BalanceScript = "pkg/polymarket/wallet_balance.py"
 	}
 
 	trader := &CopyTrader{
@@ -276,6 +289,10 @@ func (t *CopyTrader) handleTrade(ctx context.Context, repo *TradeRepository, tra
 		return
 	}
 
+	if t.cfg.SkipUpDownMarkets && isBlockedCopyMarket(trade) {
+		return
+	}
+
 	if assetID == "" {
 		dbID, err := repo.InsertCopyOrderIfMissing(ctx, t.buildCopyOrder(trade, 0, price, 0, "NO_ASSET_ID"))
 		if err != nil {
@@ -294,8 +311,6 @@ func (t *CopyTrader) handleTrade(ctx context.Context, repo *TradeRepository, tra
 		skipReason = "SOURCE_NOTIONAL_INVALID"
 	} else if price < t.cfg.MinCopyPrice || price > t.cfg.MaxCopyPrice {
 		skipReason = "PRICE_OUT_OF_RANGE"
-	} else if t.cfg.SkipUpDownMarkets && isUpDownMarket(trade) {
-		skipReason = "SHORT_TERM_UP_DOWN_MARKET"
 	} else if side == "BUY" {
 		copySize = t.calcSize(price, targetNotional)
 	} else {
@@ -357,8 +372,9 @@ func (t *CopyTrader) handleTrade(ctx context.Context, repo *TradeRepository, tra
 		return
 	}
 
-	log.Printf(
-		"跟单记录：db_id=%d trader=%s 源订单金额 %s，按封顶金额 %s 跟单：%s %s 份，单价 %s，共 %s | %s | %s",
+	logKeyEvent(
+		"跟单准备下单",
+		"db_id=%d trader=%s 源订单金额 %s，跟单金额封顶 %s | %s %s 份，单价 %s，共 %s | %s | %s",
 		dbID,
 		row.SourceWallet,
 		formatFloat(sourceNotional, 6),
@@ -387,7 +403,14 @@ func (t *CopyTrader) handleTrade(ctx context.Context, repo *TradeRepository, tra
 			log.Printf("live 跟单失败后更新订单失败：db_id=%d err=%v", dbID, updateErr)
 			return
 		}
-		log.Printf("live 跟单失败：db_id=%d err=%v", dbID, err)
+		logKeyEvent("下单失败", "db_id=%d %s %s 份，单价 %s，共 %s | 失败原因=%v",
+			dbID,
+			row.CopySide,
+			formatFloat(row.CopySize, 6),
+			formatFloat(row.CopyPrice, 6),
+			formatFloat(row.CopyNotional, 6),
+			err,
+		)
 		return
 	}
 
@@ -395,7 +418,7 @@ func (t *CopyTrader) handleTrade(ctx context.Context, repo *TradeRepository, tra
 		log.Printf("live 跟单成功后更新订单失败：db_id=%d err=%v", dbID, err)
 		return
 	}
-	logKeyEvent("live跟单提交成功", "db_id=%d %s %s 份，单价 %s，共 %s | order_response=%s",
+	logKeyEvent("下单成功", "db_id=%d %s %s 份，单价 %s，共 %s | order_response=%s",
 		dbID,
 		row.CopySide,
 		formatFloat(row.CopySize, 6),
@@ -452,6 +475,115 @@ func (t *CopyTrader) submitLiveOrder(ctx context.Context, row CopyOrderInsert) (
 	}
 
 	return append([]byte(nil), resp...), nil
+}
+
+func (t *CopyTrader) fetchWalletBalance(ctx context.Context) ([]byte, error) {
+	if strings.TrimSpace(t.cfg.PrivateKey) == "" {
+		return nil, fmt.Errorf("live 模式缺少 POLYMARKET_PRIVATE_KEY")
+	}
+	if strings.TrimSpace(t.cfg.FunderAddress) == "" {
+		return nil, fmt.Errorf("live 模式缺少 POLYMARKET_PROXY_ADDRESS")
+	}
+
+	payload, err := json.Marshal(walletBalanceRequest{
+		Host:          t.cfg.CLOBURL,
+		ChainID:       137,
+		PrivateKey:    t.cfg.PrivateKey,
+		FunderAddress: t.cfg.FunderAddress,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	cmd := exec.CommandContext(ctx, t.cfg.PythonBin, t.cfg.BalanceScript)
+	cmd.Stdin = bytes.NewReader(payload)
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		message := strings.TrimSpace(stderr.String())
+		if message == "" {
+			message = strings.TrimSpace(stdout.String())
+		}
+		if message == "" {
+			message = err.Error()
+		}
+		return nil, fmt.Errorf("读取钱包余额失败: %s", message)
+	}
+
+	resp := bytes.TrimSpace(stdout.Bytes())
+	if len(resp) == 0 {
+		return nil, fmt.Errorf("读取钱包余额失败: 空响应")
+	}
+
+	return append([]byte(nil), resp...), nil
+}
+
+func (t *CopyTrader) logWalletBalanceIfDue(ctx context.Context) {
+	if strings.ToLower(t.cfg.CopyMode) != "live" {
+		return
+	}
+	if !t.lastBalanceLog.IsZero() && time.Since(t.lastBalanceLog) < walletBalanceLogInterval {
+		return
+	}
+
+	t.lastBalanceLog = time.Now()
+	resp, err := t.fetchWalletBalance(ctx)
+	if err != nil {
+		logKeyEvent("钱包余额读取失败", "%v", err)
+		return
+	}
+
+	balance, allowance := formatWalletBalance(resp)
+	logKeyEvent("钱包余额", "pUSD余额=%s | allowance=%s | raw=%s", balance, allowance, string(resp))
+}
+
+func formatWalletBalance(resp []byte) (string, string) {
+	var data map[string]any
+	if err := json.Unmarshal(resp, &data); err != nil {
+		return "-", "-"
+	}
+
+	return formatBalanceField(data["balance"]), formatBalanceField(firstBalanceValue(data, "allowance", "allowances"))
+}
+
+func firstBalanceValue(data map[string]any, keys ...string) any {
+	for _, key := range keys {
+		if value, ok := data[key]; ok {
+			return value
+		}
+	}
+	return nil
+}
+
+func formatBalanceField(value any) string {
+	if value == nil {
+		return "-"
+	}
+
+	switch v := value.(type) {
+	case map[string]any, []any:
+		raw, _ := json.Marshal(v)
+		return string(raw)
+	}
+
+	text := strings.TrimSpace(fmt.Sprint(value))
+	if text == "" {
+		return "-"
+	}
+
+	n := SafeFloat(value)
+	if n == 0 && text != "0" && text != "0.0" && text != "0.00" {
+		return text
+	}
+	if math.Abs(n) >= 100000 {
+		return formatFloat(n/1_000_000, 6) + " (raw " + text + ")"
+	}
+
+	return formatFloat(n, 6)
 }
 
 func (t *CopyTrader) buildCopyOrder(trade Trade, copySize, copyPrice, copyNotional float64, skipReason string) CopyOrderInsert {
@@ -541,12 +673,22 @@ func (t *CopyTrader) syncCopyOrders(ctx context.Context, repo *TradeRepository) 
 			log.Printf("跟单同步失败：更新 copy_order id=%d err=%v", row.ID, err)
 			continue
 		}
+		log.Printf(
+			"订单修改：db_id=%d status=%s matched=%s 当前价=%s 盈亏=%s",
+			row.ID,
+			status,
+			formatFloat(matchedSize, 6),
+			formatFloat(currentPrice, 6),
+			formatSignedFloat(totalPNL, 6),
+		)
 		synced++
 	}
 
 	if synced > 0 {
-		log.Printf("已同步跟单 PnL/订单状态：%d 条", synced)
+		log.Printf("订单修改：本轮已同步 %d 条", synced)
 	}
+
+	t.logWalletBalanceIfDue(ctx)
 }
 
 func (t *CopyTrader) getCurrentExitPrice(ctx context.Context, assetID string) float64 {
@@ -656,6 +798,54 @@ func isUpDownMarket(trade Trade) bool {
 	return strings.Contains(title, " up or down") ||
 		strings.Contains(slug, "updown") ||
 		strings.Contains(slug, "up-or-down")
+}
+
+func isBlockedCopyMarket(trade Trade) bool {
+	return isUpDownMarket(trade) || isCryptoCopyMarket(trade)
+}
+
+func isCryptoCopyMarket(trade Trade) bool {
+	text := strings.ToLower(strings.Join([]string{
+		firstString(trade, "title", "market", "marketTitle"),
+		firstString(trade, "eventSlug", "slug"),
+		firstString(trade, "outcome"),
+	}, " "))
+
+	nameKeywords := []string{
+		"bitcoin",
+		"ethereum",
+		"dogecoin",
+		"solana",
+		"litecoin",
+		"cardano",
+	}
+
+	for _, keyword := range nameKeywords {
+		if strings.Contains(text, keyword) {
+			return true
+		}
+	}
+
+	tickerKeywords := map[string]struct{}{
+		"btc":  {},
+		"eth":  {},
+		"doge": {},
+		"xrp":  {},
+		"sol":  {},
+		"ltc":  {},
+		"ada":  {},
+	}
+
+	tokens := strings.FieldsFunc(text, func(r rune) bool {
+		return (r < 'a' || r > 'z') && (r < '0' || r > '9')
+	})
+	for _, token := range tokens {
+		if _, ok := tickerKeywords[token]; ok {
+			return true
+		}
+	}
+
+	return false
 }
 
 func nullableSQLString(value string) sql.NullString {
