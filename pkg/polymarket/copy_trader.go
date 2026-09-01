@@ -112,10 +112,11 @@ func StartCopyTrader(ctx context.Context, db *sql.DB, cfg Config, pollInterval, 
 	repo := NewTradeRepository(db)
 
 	log.Printf(
-		"跟单程序启动：mode=%s copy_usdc=%s min_copy_usdc=%s poll=%s sync=%s",
+		"跟单程序启动：mode=%s copy_usdc=%s min_copy_usdc=%s max_copy_usdc=%s poll=%s sync=%s",
 		strings.ToLower(cfg.CopyMode),
 		formatFloat(cfg.CopyUSDC, 6),
 		formatFloat(cfg.MinCopyUSDC, 6),
+		formatFloat(trader.maxCopyUSDC(), 6),
 		pollInterval,
 		syncInterval,
 	)
@@ -255,6 +256,7 @@ func (t *CopyTrader) handleTrade(ctx context.Context, repo *TradeRepository, tra
 	sourceSize := SafeFloat(trade["size"])
 	sourceNotional := roundFloat(price*sourceSize, 6)
 	assetID := firstString(trade, "asset")
+	targetNotional := t.copyNotionalForSource(sourceNotional)
 
 	if side != "BUY" && side != "SELL" {
 		return
@@ -274,8 +276,10 @@ func (t *CopyTrader) handleTrade(ctx context.Context, repo *TradeRepository, tra
 	skipReason := ""
 	if price <= 0 {
 		skipReason = "PRICE_INVALID"
+	} else if sourceNotional <= 0 {
+		skipReason = "SOURCE_NOTIONAL_INVALID"
 	} else if side == "BUY" {
-		copySize = t.calcBuySize(price)
+		copySize = t.calcSize(price, targetNotional)
 	} else {
 		available, err := repo.GetAvailableCopyPosition(ctx, assetID)
 		if err != nil {
@@ -285,7 +289,7 @@ func (t *CopyTrader) handleTrade(ctx context.Context, repo *TradeRepository, tra
 		if available <= 0 {
 			skipReason = "NO_POSITION"
 		} else {
-			copySize = math.Min(available, t.calcBuySize(price))
+			copySize = math.Min(available, t.calcSize(price, targetNotional))
 		}
 	}
 
@@ -316,11 +320,11 @@ func (t *CopyTrader) handleTrade(ctx context.Context, repo *TradeRepository, tra
 	}
 
 	log.Printf(
-		"跟单记录：db_id=%d trader=%s 源订单金额 %s，按保底金额 %s 跟单：%s %s 份，单价 %s，共 %s | %s | %s",
+		"跟单记录：db_id=%d trader=%s 源订单金额 %s，按封顶金额 %s 跟单：%s %s 份，单价 %s，共 %s | %s | %s",
 		dbID,
 		row.SourceWallet,
 		formatFloat(sourceNotional, 6),
-		formatFloat(t.actualCopyUSDC(), 6),
+		formatFloat(t.maxCopyUSDC(), 6),
 		side,
 		formatFloat(copySize, 6),
 		formatFloat(price, 6),
@@ -416,10 +420,10 @@ func (t *CopyTrader) buildCopyOrder(trade Trade, copySize, copyPrice, copyNotion
 	sourcePrice := SafeFloat(trade["price"])
 	sourceSize := SafeFloat(trade["size"])
 	raw, _ := json.Marshal(map[string]any{
-		"mode":             strings.ToLower(t.cfg.CopyMode),
-		"copy_usdc":        t.cfg.CopyUSDC,
-		"min_copy_usdc":    t.cfg.MinCopyUSDC,
-		"actual_copy_usdc": t.actualCopyUSDC(),
+		"mode":          strings.ToLower(t.cfg.CopyMode),
+		"copy_usdc":     t.cfg.CopyUSDC,
+		"min_copy_usdc": t.cfg.MinCopyUSDC,
+		"max_copy_usdc": t.maxCopyUSDC(),
 	})
 
 	orderStatus := "PENDING"
@@ -541,12 +545,19 @@ func (t *CopyTrader) getCurrentExitPrice(ctx context.Context, assetID string) fl
 	return SafeFloat(data["price"])
 }
 
-func (t *CopyTrader) calcBuySize(price float64) float64 {
-	return roundFloat(t.actualCopyUSDC()/price, 6)
+func (t *CopyTrader) calcSize(price float64, notional float64) float64 {
+	return roundFloat(notional/price, 6)
 }
 
-func (t *CopyTrader) actualCopyUSDC() float64 {
+func (t *CopyTrader) maxCopyUSDC() float64 {
 	return math.Max(t.cfg.CopyUSDC, t.cfg.MinCopyUSDC)
+}
+
+func (t *CopyTrader) copyNotionalForSource(sourceNotional float64) float64 {
+	if sourceNotional <= 0 {
+		return 0
+	}
+	return roundFloat(math.Min(sourceNotional, t.maxCopyUSDC()), 6)
 }
 
 func (t *CopyTrader) markSeen(trade Trade) {
