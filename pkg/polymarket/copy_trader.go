@@ -20,11 +20,10 @@ import (
 )
 
 type CopyTrader struct {
-	cfg            Config
-	httpClient     *http.Client
-	seen           map[string]struct{}
-	lastSync       time.Time
-	lastBalanceLog time.Time
+	cfg        Config
+	httpClient *http.Client
+	seen       map[string]struct{}
+	lastSync   time.Time
 }
 
 type CopyWallet struct {
@@ -187,6 +186,7 @@ func StartCopyTrader(ctx context.Context, db *pgxpool.Pool, cfg Config, pollInte
 		syncInterval,
 	)
 
+	go trader.startWalletBalanceLogger(ctx)
 	trader.runOnce(ctx, repo, syncInterval)
 
 	ticker := time.NewTicker(pollInterval)
@@ -203,8 +203,6 @@ func StartCopyTrader(ctx context.Context, db *pgxpool.Pool, cfg Config, pollInte
 }
 
 func (t *CopyTrader) runOnce(ctx context.Context, repo *TradeRepository, syncInterval time.Duration) {
-	t.logWalletBalanceIfDue(ctx)
-
 	wallets, err := repo.ListEnabledCopyWallets(ctx)
 	if err != nil {
 		log.Printf("跟单失败：读取启用钱包失败 err=%v", err)
@@ -677,17 +675,35 @@ func parseLiveOrderStatus(resp []byte) (liveOrderStatus, error) {
 	}, nil
 }
 
-func (t *CopyTrader) logWalletBalanceIfDue(ctx context.Context) {
+func (t *CopyTrader) startWalletBalanceLogger(ctx context.Context) {
 	if strings.ToLower(t.cfg.CopyMode) != "live" {
 		return
 	}
-	if !t.lastBalanceLog.IsZero() && time.Since(t.lastBalanceLog) < walletBalanceLogInterval {
-		return
-	}
 
-	t.lastBalanceLog = time.Now()
-	resp, err := t.fetchWalletBalance(ctx)
+	t.logWalletBalance(ctx)
+
+	ticker := time.NewTicker(walletBalanceLogInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			t.logWalletBalance(ctx)
+		}
+	}
+}
+
+func (t *CopyTrader) logWalletBalance(ctx context.Context) {
+	balanceCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+
+	resp, err := t.fetchWalletBalance(balanceCtx)
 	if err != nil {
+		if isContextDone(ctx, err) {
+			return
+		}
 		logKeyEvent("钱包余额读取失败", "%v", err)
 		return
 	}

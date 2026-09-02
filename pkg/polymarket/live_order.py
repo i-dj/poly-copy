@@ -1,5 +1,6 @@
 import json
 import sys
+from decimal import Decimal, ROUND_DOWN
 
 from py_clob_client_v2 import (
     ApiCreds,
@@ -31,6 +32,15 @@ def resolve_order_type(order_type_text):
     return order_type, "GTC"
 
 
+def decimal_text(value, places):
+    step = Decimal("1").scaleb(-places)
+    number = Decimal(str(value)).quantize(step, rounding=ROUND_DOWN)
+    text = format(number.normalize(), "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text or "0"
+
+
 def main():
     req = json.load(sys.stdin)
 
@@ -43,8 +53,10 @@ def main():
     api_passphrase = str(req.get("api_passphrase") or "")
     token_id = str(req["token_id"])
     side_text = str(req["side"]).upper()
-    price = float(req["price"])
-    size = float(req["size"])
+    price_text = decimal_text(req["price"], 6)
+    size_text = decimal_text(req["size"], 4)
+    price = Decimal(price_text)
+    size = Decimal(size_text)
     order_type_text = str(req.get("order_type") or "IOC").upper()
 
     if side_text not in ("BUY", "SELL"):
@@ -87,8 +99,8 @@ def main():
     signed_order = client.create_order(
         order_args=OrderArgs(
             token_id=token_id,
-            price=price,
-            size=size,
+            price=price_text,
+            size=size_text,
             side=Side.BUY if side_text == "BUY" else Side.SELL,
         ),
         options=PartialCreateOrderOptions(tick_size=tick_size, neg_risk=neg_risk),
@@ -100,11 +112,15 @@ def main():
     if isinstance(resp, dict):
         resp["requestedOrderType"] = order_type_text
         resp["effectiveOrderType"] = effective_order_type
+        resp["submittedPrice"] = price_text
+        resp["submittedSize"] = size_text
     else:
         resp = {
             "response": resp,
             "requestedOrderType": order_type_text,
             "effectiveOrderType": effective_order_type,
+            "submittedPrice": price_text,
+            "submittedSize": size_text,
         }
 
     print(json.dumps(resp, ensure_ascii=False), flush=True)
