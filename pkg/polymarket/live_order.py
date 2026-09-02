@@ -41,6 +41,52 @@ def decimal_text(value, places):
     return text or "0"
 
 
+def is_invalid_amounts(error):
+    return "invalid amounts" in str(error).lower()
+
+
+def create_and_post_order(
+    client,
+    token_id,
+    side_text,
+    price_text,
+    size_text,
+    tick_size,
+    neg_risk,
+    order_type,
+):
+    signed_order = client.create_order(
+        order_args=OrderArgs(
+            token_id=token_id,
+            price=float(price_text),
+            size=float(size_text),
+            side=Side.BUY if side_text == "BUY" else Side.SELL,
+        ),
+        options=PartialCreateOrderOptions(tick_size=tick_size, neg_risk=neg_risk),
+    )
+    return client.post_order(signed_order, order_type)
+
+
+def size_candidates(size_text, price_text):
+    original_size = Decimal(size_text)
+    price = Decimal(price_text)
+    original_notional = original_size * price
+
+    seen = set()
+    for places in (4, 3, 2, 1, 0):
+        candidate = Decimal(decimal_text(original_size, places))
+        if candidate <= 0:
+            continue
+        if candidate * price > original_notional:
+            continue
+
+        text = decimal_text(candidate, places)
+        if text in seen:
+            continue
+        seen.add(text)
+        yield text
+
+
 def main():
     req = json.load(sys.stdin)
 
@@ -96,31 +142,47 @@ def main():
     tick_size = client.get_tick_size(token_id)
     neg_risk = client.get_neg_risk(token_id)
 
-    signed_order = client.create_order(
-        order_args=OrderArgs(
-            token_id=token_id,
-            price=price_text,
-            size=size_text,
-            side=Side.BUY if side_text == "BUY" else Side.SELL,
-        ),
-        options=PartialCreateOrderOptions(tick_size=tick_size, neg_risk=neg_risk),
-    )
-
     order_type, effective_order_type = resolve_order_type(order_type_text)
-    resp = client.post_order(signed_order, order_type)
+
+    last_error = None
+    submitted_size_text = size_text
+    amount_retry_count = 0
+    for candidate_size_text in size_candidates(size_text, price_text):
+        try:
+            resp = create_and_post_order(
+                client,
+                token_id,
+                side_text,
+                price_text,
+                candidate_size_text,
+                tick_size,
+                neg_risk,
+                order_type,
+            )
+            submitted_size_text = candidate_size_text
+            break
+        except Exception as exc:
+            last_error = exc
+            if not is_invalid_amounts(exc):
+                raise
+            amount_retry_count += 1
+    else:
+        raise last_error
 
     if isinstance(resp, dict):
         resp["requestedOrderType"] = order_type_text
         resp["effectiveOrderType"] = effective_order_type
         resp["submittedPrice"] = price_text
-        resp["submittedSize"] = size_text
+        resp["submittedSize"] = submitted_size_text
+        resp["amountRetryCount"] = amount_retry_count
     else:
         resp = {
             "response": resp,
             "requestedOrderType": order_type_text,
             "effectiveOrderType": effective_order_type,
             "submittedPrice": price_text,
-            "submittedSize": size_text,
+            "submittedSize": submitted_size_text,
+            "amountRetryCount": amount_retry_count,
         }
 
     print(json.dumps(resp, ensure_ascii=False), flush=True)

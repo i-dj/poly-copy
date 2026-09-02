@@ -479,7 +479,7 @@ func (t *CopyTrader) handleTrade(ctx context.Context, repo *TradeRepository, tra
 			formatFloat(row.CopySize, 6),
 			formatFloat(row.CopyPrice, 6),
 			formatFloat(row.CopyNotional, 6),
-			oneLine(err.Error(), 240),
+			compactError(err.Error(), 320),
 		)
 		return
 	}
@@ -708,8 +708,8 @@ func (t *CopyTrader) logWalletBalance(ctx context.Context) {
 		return
 	}
 
-	balance, allowance := formatWalletBalance(resp)
-	logKeyEvent("钱包余额", "pUSD余额=%s | allowance=%s | raw=%s", balance, allowance, string(resp))
+	balance, _ := formatWalletBalance(resp)
+	logKeyEvent("钱包余额", "pUSD余额=%s", balance)
 }
 
 func formatWalletBalance(resp []byte) (string, string) {
@@ -989,6 +989,16 @@ func oneLine(value string, limit int) string {
 		return value[:limit] + "..."
 	}
 	return value
+}
+
+func compactError(value string, limit int) string {
+	value = strings.Join(strings.Fields(value), " ")
+	if limit <= 0 || len(value) <= limit {
+		return value
+	}
+
+	half := limit / 2
+	return value[:half] + " ... " + value[len(value)-half:]
 }
 
 func (t *CopyTrader) calcOrderAmount(price float64, targetNotional float64, maxSize float64) (float64, float64) {
