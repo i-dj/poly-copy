@@ -117,7 +117,7 @@ type orderBookMeta struct {
 	TickSize     float64
 }
 
-const walletBalanceLogInterval = 5 * time.Minute
+const walletBalanceLogInterval = 10 * time.Second
 
 func StartCopyTrader(ctx context.Context, db *pgxpool.Pool, cfg Config, pollInterval, syncInterval time.Duration) {
 	if pollInterval <= 0 {
@@ -176,7 +176,7 @@ func StartCopyTrader(ctx context.Context, db *pgxpool.Pool, cfg Config, pollInte
 	}
 
 	log.Printf(
-		"跟单程序启动：mode=%s max_copy_usdc=%s source_min=不限制 price_range=%s-%s price_offset=%s order_type=IOC skip_up_down=%t poll=%s sync=%s",
+		"跟单程序启动：mode=%s max_copy_usdc=%s source_min=不限制 price_range=%s-%s price_offset=%s order_type=IOC/FAK skip_up_down=%t poll=%s sync=%s",
 		strings.ToLower(cfg.CopyMode),
 		formatFloat(trader.maxCopyUSDC(), 6),
 		formatFloat(cfg.MinCopyPrice, 6),
@@ -443,7 +443,7 @@ func (t *CopyTrader) handleTrade(ctx context.Context, repo *TradeRepository, tra
 
 	logKeyEvent(
 		"下单【提交】",
-		"db_id=%d 方向=%s 数量=%s 单价=%s 总金额=%s 结果=提交中 | trader=%s 源金额=%s 封顶=%s 源价=%s 类型=IOC | %s | %s",
+		"db_id=%d 方向=%s 数量=%s 单价=%s 总金额=%s 结果=提交中 | trader=%s 源金额=%s 封顶=%s 源价=%s 请求类型=IOC | %s | %s",
 		dbID,
 		side,
 		formatFloat(copySize, 6),

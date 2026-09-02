@@ -20,9 +20,9 @@ def resolve_order_type(order_type_text):
         return order_type, requested
 
     if requested == "IOC":
-        order_type = getattr(OrderType, "FOK", None)
+        order_type = getattr(OrderType, "FAK", None)
         if order_type is not None:
-            return order_type, "FOK"
+            return order_type, "FAK"
 
     order_type = getattr(OrderType, "GTC", None)
     if order_type is None:
