@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
@@ -346,6 +347,7 @@ func (t *CopyTrader) handleTrade(ctx context.Context, repo *TradeRepository, tra
 	}
 
 	copySize := 0.0
+	copyNotional := 0.0
 	availableCopy := 0.0
 	skipReason := ""
 	copyPrice := t.adjustCopyPrice(side, sourcePrice)
@@ -356,7 +358,7 @@ func (t *CopyTrader) handleTrade(ctx context.Context, repo *TradeRepository, tra
 	} else if sourcePrice < t.cfg.MinCopyPrice || sourcePrice > t.cfg.MaxCopyPrice {
 		skipReason = "PRICE_OUT_OF_RANGE"
 	} else if side == "BUY" {
-		copySize = t.calcSize(copyPrice, targetNotional)
+		copySize, copyNotional = t.calcOrderAmount(copyPrice, targetNotional, 0)
 	} else {
 		available, err := repo.GetAvailableCopyPosition(ctx, assetID)
 		if err != nil {
@@ -367,11 +369,14 @@ func (t *CopyTrader) handleTrade(ctx context.Context, repo *TradeRepository, tra
 			skipReason = "NO_POSITION"
 		} else {
 			availableCopy = available
-			copySize = math.Min(available, t.calcSize(copyPrice, targetNotional))
+			copySize, copyNotional = t.calcOrderAmount(copyPrice, targetNotional, available)
 		}
 	}
 
-	copyNotional := roundFloat(copySize*copyPrice, 6)
+	if skipReason == "" && copySize <= 0 {
+		skipReason = "COPY_AMOUNT_BELOW_PRECISION"
+	}
+
 	row := t.buildCopyOrder(trade, copySize, copyPrice, copyNotional, skipReason)
 
 	if skipReason == "" {
@@ -386,14 +391,16 @@ func (t *CopyTrader) handleTrade(ctx context.Context, repo *TradeRepository, tra
 		} else {
 			copyPrice = t.alignCopyPrice(side, copyPrice, meta.TickSize)
 			if side == "BUY" {
-				copySize = t.calcSize(copyPrice, targetNotional)
+				copySize, copyNotional = t.calcOrderAmount(copyPrice, targetNotional, 0)
 			} else {
-				copySize = math.Min(availableCopy, t.calcSize(copyPrice, targetNotional))
+				copySize, copyNotional = t.calcOrderAmount(copyPrice, targetNotional, availableCopy)
 			}
-			copyNotional = roundFloat(copySize*copyPrice, 6)
 			row = t.buildCopyOrder(trade, copySize, copyPrice, copyNotional, "")
 
-			if meta.MinOrderSize > 0 && copySize < meta.MinOrderSize {
+			if copySize <= 0 {
+				skipReason = "COPY_AMOUNT_BELOW_PRECISION"
+				row = t.buildCopyOrder(trade, 0, copyPrice, 0, skipReason)
+			} else if meta.MinOrderSize > 0 && copySize < meta.MinOrderSize {
 				skipReason = "COPY_SIZE_BELOW_MIN_ORDER_SIZE"
 				row = t.buildCopyOrder(trade, 0, copyPrice, 0, skipReason)
 				log.Printf("跟单跳过：copy_size %s 小于市场最小下单数量 %s | %s | %s",
@@ -929,10 +936,6 @@ func (t *CopyTrader) fetchOrderBookMeta(ctx context.Context, assetID string) (or
 	}, nil
 }
 
-func (t *CopyTrader) calcSize(price float64, notional float64) float64 {
-	return roundFloat(notional/price, 6)
-}
-
 func (t *CopyTrader) maxCopyUSDC() float64 {
 	return math.Max(t.cfg.CopyUSDC, t.cfg.MinCopyUSDC)
 }
@@ -970,6 +973,93 @@ func oneLine(value string, limit int) string {
 		return value[:limit] + "..."
 	}
 	return value
+}
+
+func (t *CopyTrader) calcOrderAmount(price float64, targetNotional float64, maxSize float64) (float64, float64) {
+	if price <= 0 || targetNotional <= 0 {
+		return 0, 0
+	}
+
+	const sizeScale int64 = 10_000
+	const centsScale int64 = 100
+
+	priceInt, priceScale := scaledDecimal(price, 6)
+	if priceInt <= 0 || priceScale <= 0 {
+		return 0, 0
+	}
+
+	targetCents := int64(math.Floor(targetNotional*float64(centsScale) + 1e-9))
+	if targetCents <= 0 {
+		return 0, 0
+	}
+
+	maxUnits := targetCents * priceScale * sizeScale / (centsScale * priceInt)
+	if maxSize > 0 {
+		maxSizeUnits := int64(math.Floor(maxSize*float64(sizeScale) + 1e-9))
+		if maxSizeUnits < maxUnits {
+			maxUnits = maxSizeUnits
+		}
+	}
+	if maxUnits <= 0 {
+		return 0, 0
+	}
+
+	denominator := priceScale * sizeScale
+	step := denominator / gcd(priceInt*centsScale, denominator)
+	units := (maxUnits / step) * step
+	if units <= 0 {
+		return 0, 0
+	}
+
+	cents := priceInt * units * centsScale / denominator
+	if cents <= 0 {
+		return 0, 0
+	}
+
+	return float64(units) / float64(sizeScale), float64(cents) / float64(centsScale)
+}
+
+func scaledDecimal(value float64, places int) (int64, int64) {
+	text := formatFloat(value, places)
+	parts := strings.SplitN(text, ".", 2)
+	if len(parts) == 1 {
+		n, err := strconv.ParseInt(parts[0], 10, 64)
+		if err != nil {
+			return 0, 0
+		}
+		return n, 1
+	}
+
+	whole := parts[0]
+	fraction := strings.TrimRight(parts[1], "0")
+	if fraction == "" {
+		n, err := strconv.ParseInt(whole, 10, 64)
+		if err != nil {
+			return 0, 0
+		}
+		return n, 1
+	}
+
+	scale := int64(math.Pow10(len(fraction)))
+	n, err := strconv.ParseInt(whole+fraction, 10, 64)
+	if err != nil {
+		return 0, 0
+	}
+
+	return n, scale
+}
+
+func gcd(a int64, b int64) int64 {
+	if a < 0 {
+		a = -a
+	}
+	if b < 0 {
+		b = -b
+	}
+	for b != 0 {
+		a, b = b, a%b
+	}
+	return a
 }
 
 func (t *CopyTrader) copyNotionalForSource(sourceNotional float64) float64 {
