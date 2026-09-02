@@ -203,6 +203,8 @@ func StartCopyTrader(ctx context.Context, db *pgxpool.Pool, cfg Config, pollInte
 }
 
 func (t *CopyTrader) runOnce(ctx context.Context, repo *TradeRepository, syncInterval time.Duration) {
+	t.logWalletBalanceIfDue(ctx)
+
 	wallets, err := repo.ListEnabledCopyWallets(ctx)
 	if err != nil {
 		log.Printf("跟单失败：读取启用钱包失败 err=%v", err)
@@ -862,8 +864,6 @@ func (t *CopyTrader) syncCopyOrders(ctx context.Context, repo *TradeRepository) 
 	if synced > 0 {
 		log.Printf("订单修改：本轮已同步 %d 条", synced)
 	}
-
-	t.logWalletBalanceIfDue(ctx)
 }
 
 func (t *CopyTrader) getCurrentExitPrice(ctx context.Context, assetID string) float64 {
