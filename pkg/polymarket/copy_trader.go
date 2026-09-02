@@ -26,6 +26,7 @@ type CopyTrader struct {
 	seen               map[string]struct{}
 	walletBackoffUntil map[string]time.Time
 	lastWalletFetch    time.Time
+	lastWalletLog      time.Time
 	lastSync           time.Time
 }
 
@@ -161,6 +162,9 @@ func StartCopyTrader(ctx context.Context, db *pgxpool.Pool, cfg Config, pollInte
 	if cfg.MaxWalletLoss <= 0 {
 		cfg.MaxWalletLoss = 10
 	}
+	if cfg.MaxWalletLossStreak <= 0 {
+		cfg.MaxWalletLossStreak = 3
+	}
 	if cfg.CopyTradeLimit <= 0 {
 		cfg.CopyTradeLimit = 10
 	}
@@ -208,11 +212,12 @@ func StartCopyTrader(ctx context.Context, db *pgxpool.Pool, cfg Config, pollInte
 	}
 
 	log.Printf(
-		"跟单程序启动：mode=%s max_copy_usdc=%s source_min=%s max_wallet_loss=%s price_range=%s-%s price_offset=%s order_type=IOC/FAK skip_up_down=%t poll=%s sync=%s",
+		"跟单程序启动：mode=%s max_copy_usdc=%s source_min=%s max_wallet_loss=%s loss_streak=%d price_range=%s-%s price_offset=%s order_type=IOC/FAK skip_up_down=%t poll=%s sync=%s",
 		strings.ToLower(cfg.CopyMode),
 		formatFloat(trader.maxCopyUSDC(), 6),
 		formatFloat(cfg.MinSourceNotional, 6),
 		formatFloat(cfg.MaxWalletLoss, 6),
+		cfg.MaxWalletLossStreak,
 		formatFloat(cfg.MinCopyPrice, 6),
 		formatFloat(cfg.MaxCopyPrice, 6),
 		formatFloat(cfg.CopyPriceOffset, 6),
@@ -245,9 +250,11 @@ func (t *CopyTrader) runOnce(ctx context.Context, repo *TradeRepository, syncInt
 	}
 
 	if len(wallets) == 0 {
-		log.Println("跟单等待：copy_wallet 没有 enable=1 的钱包")
+		log.Println("跟单等待：copy_wallet 没有符合条件的 enable=1 前排钱包")
 		return
 	}
+
+	t.logActiveWalletCount(len(wallets))
 
 	for _, wallet := range wallets {
 		if ctx.Err() != nil {
@@ -260,6 +267,14 @@ func (t *CopyTrader) runOnce(ctx context.Context, repo *TradeRepository, syncInt
 		t.syncCopyOrders(ctx, repo)
 		t.lastSync = time.Now()
 	}
+}
+
+func (t *CopyTrader) logActiveWalletCount(count int) {
+	if !t.lastWalletLog.IsZero() && time.Since(t.lastWalletLog) < time.Minute {
+		return
+	}
+	t.lastWalletLog = time.Now()
+	log.Printf("跟单钱包：当前只跟 copy_wallet 里最强前 %d 个账号", count)
 }
 
 func (t *CopyTrader) processWallet(ctx context.Context, repo *TradeRepository, wallet CopyWallet) {
@@ -1032,7 +1047,7 @@ func (t *CopyTrader) getCurrentExitPrice(ctx context.Context, assetID string) fl
 }
 
 func (t *CopyTrader) disableLosingWallets(ctx context.Context, repo *TradeRepository) {
-	disabled, err := repo.DisableCopyWalletsByLoss(ctx, t.cfg.MaxWalletLoss)
+	disabled, err := repo.DisableCopyWalletsByLoss(ctx, t.cfg.MaxWalletLoss, t.cfg.MaxWalletLossStreak)
 	if err != nil {
 		if isContextDone(ctx, err) {
 			return
@@ -1044,10 +1059,12 @@ func (t *CopyTrader) disableLosingWallets(ctx context.Context, repo *TradeReposi
 	for _, wallet := range disabled {
 		logKeyEvent(
 			"风控停用钱包",
-			"wallet=%s 跟单净亏=%s 成交=%d 笔，已自动 enable=0",
+			"wallet=%s 跟单净亏=%s 成交=%d 笔 连亏=%d 原因=%s，已自动 enable=0",
 			wallet.Wallet,
 			formatSignedFloat(wallet.NetPNL, 6),
 			wallet.Trades,
+			wallet.LossStreak,
+			wallet.Reason,
 		)
 	}
 }

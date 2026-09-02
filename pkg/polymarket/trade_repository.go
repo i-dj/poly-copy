@@ -37,9 +37,11 @@ type SettlementResult struct {
 }
 
 type DisabledCopyWallet struct {
-	Wallet string
-	NetPNL float64
-	Trades int64
+	Wallet     string
+	NetPNL     float64
+	Trades     int64
+	LossStreak int64
+	Reason     string
 }
 
 type openTrade struct {
@@ -429,7 +431,16 @@ func (r *TradeRepository) ListEnabledCopyWallets(ctx context.Context) ([]CopyWal
 		WHERE enable = 1
 			AND wallet IS NOT NULL
 			AND wallet <> ''
-		ORDER BY id ASC
+			AND COALESCE(closed_count, 0) >= 10
+			AND COALESCE(total_cost, 0) >= 20
+			AND COALESCE(net_pnl, 0) > 0
+		ORDER BY
+			COALESCE(win_rate_pct, 0) DESC,
+			COALESCE(profit_per_usdc, 0) DESC,
+			COALESCE(net_pnl, 0) DESC,
+			COALESCE(closed_count, 0) DESC,
+			id ASC
+		LIMIT 5
 	`)
 	if err != nil {
 		return nil, err
@@ -498,39 +509,92 @@ func (r *TradeRepository) MarkCopyWalletError(ctx context.Context, wallet string
 	return err
 }
 
-func (r *TradeRepository) DisableCopyWalletsByLoss(ctx context.Context, maxLoss float64) ([]DisabledCopyWallet, error) {
-	if maxLoss <= 0 {
+func (r *TradeRepository) DisableCopyWalletsByLoss(ctx context.Context, maxLoss float64, maxLossStreak int) ([]DisabledCopyWallet, error) {
+	if maxLoss <= 0 && maxLossStreak <= 0 {
 		return nil, nil
+	}
+	if maxLossStreak <= 0 {
+		maxLossStreak = 3
 	}
 
 	rows, err := r.db.Query(ctx, `
-		WITH losers AS (
+		WITH matched AS (
 			SELECT
 				source_wallet AS wallet,
-				ROUND(SUM(COALESCE(total_pnl, 0)), 6) AS net_pnl,
-				COUNT(*) AS trades
+				COALESCE(total_pnl, 0)::numeric AS pnl,
+				submitted_at,
+				updated_at,
+				id
 			FROM copy_orders
 			WHERE source_wallet IS NOT NULL
 				AND source_wallet <> ''
 				AND submit_success = true
 				AND COALESCE(matched_size, 0) > 0
-			GROUP BY source_wallet
-			HAVING SUM(COALESCE(total_pnl, 0)) <= -$1
+		),
+		totals AS (
+			SELECT
+				wallet,
+				ROUND(SUM(pnl), 6) AS net_pnl,
+				COUNT(*) AS trades
+			FROM matched
+			GROUP BY wallet
+		),
+		recent AS (
+			SELECT
+				wallet,
+				pnl,
+				ROW_NUMBER() OVER (
+					PARTITION BY wallet
+					ORDER BY COALESCE(submitted_at, updated_at) DESC, id DESC
+				) AS rn
+			FROM matched
+		),
+		streaks AS (
+			SELECT
+				wallet,
+				COUNT(*) AS recent_count,
+				COUNT(*) FILTER (WHERE pnl < 0) AS loss_streak
+			FROM recent
+			WHERE rn <= $2::int
+			GROUP BY wallet
+		),
+		losers AS (
+			SELECT
+				totals.wallet,
+				totals.net_pnl,
+				totals.trades,
+				COALESCE(streaks.loss_streak, 0) AS loss_streak,
+				CASE
+					WHEN $1::numeric > 0 AND totals.net_pnl <= -($1::numeric)
+						THEN '跟单净亏超过保护线，已自动停用'
+					WHEN $2::int > 0
+						AND COALESCE(streaks.recent_count, 0) >= $2::int
+						AND COALESCE(streaks.loss_streak, 0) >= $2::int
+						THEN '最近连续亏损，已自动停用'
+				END AS reason
+			FROM totals
+			LEFT JOIN streaks ON streaks.wallet = totals.wallet
+			WHERE ($1::numeric > 0 AND totals.net_pnl <= -($1::numeric))
+				OR (
+					$2::int > 0
+					AND COALESCE(streaks.recent_count, 0) >= $2::int
+					AND COALESCE(streaks.loss_streak, 0) >= $2::int
+				)
 		),
 		disabled AS (
 			UPDATE copy_wallet AS cw
 			SET
 				enable = 0,
-				last_error = '跟单净亏超过保护线，已自动停用',
+				last_error = losers.reason,
 				updated_at = now()
 			FROM losers
 			WHERE lower(cw.wallet) = lower(losers.wallet)
 				AND cw.enable = 1
-			RETURNING cw.wallet, losers.net_pnl, losers.trades
+			RETURNING cw.wallet, losers.net_pnl, losers.trades, losers.loss_streak, losers.reason
 		)
-		SELECT wallet, net_pnl, trades
+		SELECT wallet, net_pnl, trades, loss_streak, reason
 		FROM disabled
-	`, maxLoss)
+	`, maxLoss, maxLossStreak)
 	if err != nil {
 		return nil, err
 	}
@@ -539,7 +603,7 @@ func (r *TradeRepository) DisableCopyWalletsByLoss(ctx context.Context, maxLoss 
 	var disabled []DisabledCopyWallet
 	for rows.Next() {
 		var row DisabledCopyWallet
-		if err := rows.Scan(&row.Wallet, &row.NetPNL, &row.Trades); err != nil {
+		if err := rows.Scan(&row.Wallet, &row.NetPNL, &row.Trades, &row.LossStreak, &row.Reason); err != nil {
 			return nil, err
 		}
 		disabled = append(disabled, row)

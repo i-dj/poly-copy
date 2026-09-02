@@ -83,6 +83,7 @@ func main() {
 		MinCopyUSDC:         5,
 		MinSourceNotional:   20,
 		MaxWalletLoss:       10,
+		MaxWalletLossStreak: 3,
 		CopyTradeLimit:      10,
 		CopyPriceOffset:     0,
 		MinCopyPrice:        0.001,

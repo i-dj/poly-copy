@@ -25,6 +25,7 @@ type Config struct {
 	MinCopyUSDC         float64
 	MinSourceNotional   float64
 	MaxWalletLoss       float64
+	MaxWalletLossStreak int
 	CopyTradeLimit      int
 	CopyPriceOffset     float64
 	MinCopyPrice        float64
