@@ -552,6 +552,42 @@ func (r *TradeRepository) DisableCopyWalletsByLoss(ctx context.Context, maxLoss 
 	return disabled, nil
 }
 
+func (r *TradeRepository) RepairCopyOrderMatchedSizes(ctx context.Context) (int64, error) {
+	result, err := r.db.Exec(ctx, `
+		WITH bad AS (
+			SELECT
+				id,
+				matched_size AS old_matched_size,
+				copy_size AS fixed_matched_size
+			FROM copy_orders
+			WHERE COALESCE(matched_size, 0) > copy_size
+				AND copy_size > 0
+		)
+		UPDATE copy_orders AS co
+		SET
+			matched_size = bad.fixed_matched_size,
+			filled_notional = ROUND((bad.fixed_matched_size * co.copy_price)::numeric, 6),
+			unrealized_pnl = CASE
+				WHEN bad.old_matched_size > 0 AND co.unrealized_pnl IS NOT NULL
+					THEN ROUND((co.unrealized_pnl / bad.old_matched_size * bad.fixed_matched_size)::numeric, 6)
+				ELSE co.unrealized_pnl
+			END,
+			total_pnl = CASE
+				WHEN bad.old_matched_size > 0 AND co.total_pnl IS NOT NULL
+					THEN ROUND((co.total_pnl / bad.old_matched_size * bad.fixed_matched_size)::numeric, 6)
+				ELSE co.total_pnl
+			END,
+			updated_at = now()
+		FROM bad
+		WHERE co.id = bad.id
+	`)
+	if err != nil {
+		return 0, err
+	}
+
+	return result.RowsAffected(), nil
+}
+
 func (r *TradeRepository) GetAvailableCopyPosition(ctx context.Context, assetID string) (float64, error) {
 	rows, err := r.db.Query(ctx, `
 		SELECT copy_side, copy_size, matched_size, dry_run, submit_success
@@ -710,8 +746,7 @@ func (r *TradeRepository) UpdateCopyOrderSuccess(ctx context.Context, id int64, 
 	if orderStatus == "" {
 		orderStatus = "SUBMITTED"
 	}
-	matchedSize := firstResponseFloat(resp, "size_matched", "matchedSize")
-	filledNotional := firstResponseFloat(resp, "takingAmount", "makingAmount")
+	matchedSize := firstResponseFloat(resp, "submittedSize", "size_matched", "matchedSize", "matched_size", "filled_size", "filledSize")
 
 	_, err := r.db.Exec(ctx, `
 		UPDATE copy_orders
@@ -720,13 +755,13 @@ func (r *TradeRepository) UpdateCopyOrderSuccess(ctx context.Context, id int64, 
 			order_id = $1,
 			order_status = $2,
 			raw_response = $3::jsonb,
-			matched_size = $4::numeric,
-			filled_notional = $5::numeric,
-			is_filled = CASE WHEN $4::numeric > 0 THEN true ELSE false END,
+			matched_size = LEAST($4::numeric, copy_size),
+			filled_notional = ROUND((LEAST($4::numeric, copy_size) * copy_price)::numeric, 6),
+			is_filled = CASE WHEN LEAST($4::numeric, copy_size) > 0 THEN true ELSE false END,
 			submitted_at = now(),
 			updated_at = now()
-		WHERE id = $6
-	`, nullableString(true, orderID), orderStatus, string(rawResponse), matchedSize, filledNotional, id)
+		WHERE id = $5
+	`, nullableString(true, orderID), orderStatus, string(rawResponse), matchedSize, id)
 	return err
 }
 

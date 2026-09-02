@@ -201,6 +201,11 @@ func StartCopyTrader(ctx context.Context, db *pgxpool.Pool, cfg Config, pollInte
 	if err := repo.EnsureCopyWalletIndex(ctx); err != nil {
 		log.Printf("跟单提醒：创建 copy_wallet 钱包索引失败 err=%v", err)
 	}
+	if repaired, err := repo.RepairCopyOrderMatchedSizes(ctx); err != nil {
+		log.Printf("跟单提醒：修复异常成交数量失败 err=%v", err)
+	} else if repaired > 0 {
+		logKeyEvent("数据修复", "已修复 %d 笔 matched_size 大于 copy_size 的跟单记录", repaired)
+	}
 
 	log.Printf(
 		"跟单程序启动：mode=%s max_copy_usdc=%s source_min=%s max_wallet_loss=%s price_range=%s-%s price_offset=%s order_type=IOC/FAK skip_up_down=%t poll=%s sync=%s",
@@ -949,7 +954,7 @@ func (t *CopyTrader) syncCopyOrders(ctx context.Context, repo *TradeRepository) 
 					status = info.Status
 				}
 				if info.MatchedSize > 0 {
-					matchedSize = info.MatchedSize
+					matchedSize = math.Min(info.MatchedSize, row.CopySize)
 				}
 			}
 		}
