@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"net/http"
@@ -20,10 +21,12 @@ import (
 )
 
 type CopyTrader struct {
-	cfg        Config
-	httpClient *http.Client
-	seen       map[string]struct{}
-	lastSync   time.Time
+	cfg                Config
+	httpClient         *http.Client
+	seen               map[string]struct{}
+	walletBackoffUntil map[string]time.Time
+	lastWalletFetch    time.Time
+	lastSync           time.Time
 }
 
 type CopyWallet struct {
@@ -116,7 +119,25 @@ type orderBookMeta struct {
 	TickSize     float64
 }
 
-const walletBalanceLogInterval = 10 * time.Second
+const (
+	walletBalanceLogInterval = 10 * time.Second
+	dataAPI429Backoff        = 45 * time.Second
+	copyWalletRequestSpacing = 300 * time.Millisecond
+)
+
+type dataAPIStatusError struct {
+	StatusCode int
+	Status     string
+	Body       string
+	RetryAfter time.Duration
+}
+
+func (e dataAPIStatusError) Error() string {
+	if e.Body == "" {
+		return "Data API 状态异常: " + e.Status
+	}
+	return "Data API 状态异常: " + e.Status + " body=" + oneLine(e.Body, 160)
+}
 
 func StartCopyTrader(ctx context.Context, db *pgxpool.Pool, cfg Config, pollInterval, syncInterval time.Duration) {
 	if pollInterval <= 0 {
@@ -134,11 +155,17 @@ func StartCopyTrader(ctx context.Context, db *pgxpool.Pool, cfg Config, pollInte
 	if cfg.MinCopyUSDC <= 0 {
 		cfg.MinCopyUSDC = 5
 	}
+	if cfg.MinSourceNotional <= 0 {
+		cfg.MinSourceNotional = 20
+	}
+	if cfg.MaxWalletLoss <= 0 {
+		cfg.MaxWalletLoss = 10
+	}
 	if cfg.CopyTradeLimit <= 0 {
 		cfg.CopyTradeLimit = 10
 	}
-	if cfg.CopyPriceOffset <= 0 {
-		cfg.CopyPriceOffset = 0.01
+	if cfg.CopyPriceOffset < 0 {
+		cfg.CopyPriceOffset = 0
 	}
 	if cfg.MinCopyPrice <= 0 {
 		cfg.MinCopyPrice = 0.001
@@ -164,7 +191,8 @@ func StartCopyTrader(ctx context.Context, db *pgxpool.Pool, cfg Config, pollInte
 		httpClient: &http.Client{
 			Timeout: 15 * time.Second,
 		},
-		seen: make(map[string]struct{}),
+		seen:               make(map[string]struct{}),
+		walletBackoffUntil: make(map[string]time.Time),
 	}
 	repo := NewTradeRepository(db)
 	if err := repo.EnsureCopyWalletSchema(ctx); err != nil {
@@ -175,9 +203,11 @@ func StartCopyTrader(ctx context.Context, db *pgxpool.Pool, cfg Config, pollInte
 	}
 
 	log.Printf(
-		"跟单程序启动：mode=%s max_copy_usdc=%s source_min=不限制 price_range=%s-%s price_offset=%s order_type=IOC/FAK skip_up_down=%t poll=%s sync=%s",
+		"跟单程序启动：mode=%s max_copy_usdc=%s source_min=%s max_wallet_loss=%s price_range=%s-%s price_offset=%s order_type=IOC/FAK skip_up_down=%t poll=%s sync=%s",
 		strings.ToLower(cfg.CopyMode),
 		formatFloat(trader.maxCopyUSDC(), 6),
+		formatFloat(cfg.MinSourceNotional, 6),
+		formatFloat(cfg.MaxWalletLoss, 6),
 		formatFloat(cfg.MinCopyPrice, 6),
 		formatFloat(cfg.MaxCopyPrice, 6),
 		formatFloat(cfg.CopyPriceOffset, 6),
@@ -228,19 +258,38 @@ func (t *CopyTrader) runOnce(ctx context.Context, repo *TradeRepository, syncInt
 }
 
 func (t *CopyTrader) processWallet(ctx context.Context, repo *TradeRepository, wallet CopyWallet) {
+	if until, ok := t.walletBackoffUntil[wallet.Wallet]; ok && time.Now().Before(until) {
+		return
+	}
+
 	limit := t.cfg.CopyTradeLimit
 	if !wallet.LastCopyTime.Valid {
 		limit = 30
 	}
 
+	if err := t.waitDataAPISlot(ctx); err != nil {
+		return
+	}
+
 	trades, err := t.fetchWalletTrades(ctx, wallet.Wallet, limit)
 	if err != nil {
+		var statusErr dataAPIStatusError
+		if errors.As(err, &statusErr) && statusErr.StatusCode == http.StatusTooManyRequests {
+			backoff := statusErr.RetryAfter
+			if backoff <= 0 {
+				backoff = dataAPI429Backoff
+			}
+			t.walletBackoffUntil[wallet.Wallet] = time.Now().Add(backoff)
+			log.Printf("跟单限流：wallet=%s Data API 429，暂停拉取 %s", wallet.Wallet, backoff)
+			return
+		}
 		if updateErr := repo.MarkCopyWalletError(ctx, wallet.Wallet, err); updateErr != nil {
 			log.Printf("跟单提醒：记录钱包错误失败 wallet=%s err=%v", wallet.Wallet, updateErr)
 		}
 		log.Printf("跟单失败：拉取钱包成交失败 wallet=%s err=%v", wallet.Wallet, err)
 		return
 	}
+	delete(t.walletBackoffUntil, wallet.Wallet)
 
 	lastSeenTradeTime := latestTradeTime(trades)
 	if !wallet.LastCopyTime.Valid {
@@ -309,7 +358,13 @@ func (t *CopyTrader) fetchWalletTrades(ctx context.Context, wallet string, limit
 	defer resp.Body.Close()
 
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return nil, fmt.Errorf("Data API 状态异常: %s", resp.Status)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return nil, dataAPIStatusError{
+			StatusCode: resp.StatusCode,
+			Status:     resp.Status,
+			Body:       string(body),
+			RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After")),
+		}
 	}
 
 	var trades []Trade
@@ -318,6 +373,55 @@ func (t *CopyTrader) fetchWalletTrades(ctx context.Context, wallet string, limit
 	}
 
 	return trades, nil
+}
+
+func parseRetryAfter(value string) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+
+	seconds, err := strconv.Atoi(value)
+	if err == nil && seconds > 0 {
+		return time.Duration(seconds) * time.Second
+	}
+
+	when, err := http.ParseTime(value)
+	if err != nil {
+		return 0
+	}
+
+	delay := time.Until(when)
+	if delay < 0 {
+		return 0
+	}
+
+	return delay
+}
+
+func (t *CopyTrader) waitDataAPISlot(ctx context.Context) error {
+	if t.lastWalletFetch.IsZero() {
+		t.lastWalletFetch = time.Now()
+		return nil
+	}
+
+	next := t.lastWalletFetch.Add(copyWalletRequestSpacing)
+	delay := time.Until(next)
+	if delay <= 0 {
+		t.lastWalletFetch = time.Now()
+		return nil
+	}
+
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		t.lastWalletFetch = time.Now()
+		return nil
+	}
 }
 
 func (t *CopyTrader) handleTrade(ctx context.Context, repo *TradeRepository, trade Trade) {
@@ -329,6 +433,10 @@ func (t *CopyTrader) handleTrade(ctx context.Context, repo *TradeRepository, tra
 	targetNotional := t.copyNotionalForSource(sourceNotional)
 
 	if side != "BUY" && side != "SELL" {
+		return
+	}
+
+	if side == "BUY" && sourceNotional < t.cfg.MinSourceNotional {
 		return
 	}
 
@@ -880,6 +988,8 @@ func (t *CopyTrader) syncCopyOrders(ctx context.Context, repo *TradeRepository) 
 	if synced > 0 {
 		log.Printf("订单修改：本轮已同步 %d 条", synced)
 	}
+
+	t.disableLosingWallets(ctx, repo)
 }
 
 func (t *CopyTrader) getCurrentExitPrice(ctx context.Context, assetID string) float64 {
@@ -914,6 +1024,27 @@ func (t *CopyTrader) getCurrentExitPrice(ctx context.Context, assetID string) fl
 	}
 
 	return SafeFloat(data["price"])
+}
+
+func (t *CopyTrader) disableLosingWallets(ctx context.Context, repo *TradeRepository) {
+	disabled, err := repo.DisableCopyWalletsByLoss(ctx, t.cfg.MaxWalletLoss)
+	if err != nil {
+		if isContextDone(ctx, err) {
+			return
+		}
+		log.Printf("风控失败：检查亏损钱包失败 err=%v", err)
+		return
+	}
+
+	for _, wallet := range disabled {
+		logKeyEvent(
+			"风控停用钱包",
+			"wallet=%s 跟单净亏=%s 成交=%d 笔，已自动 enable=0",
+			wallet.Wallet,
+			formatSignedFloat(wallet.NetPNL, 6),
+			wallet.Trades,
+		)
+	}
 }
 
 func (t *CopyTrader) fetchOrderBookMeta(ctx context.Context, assetID string) (orderBookMeta, error) {

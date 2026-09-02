@@ -36,6 +36,12 @@ type SettlementResult struct {
 	PNL     float64
 }
 
+type DisabledCopyWallet struct {
+	Wallet string
+	NetPNL float64
+	Trades int64
+}
+
 type openTrade struct {
 	ID           int64
 	Price        float64
@@ -232,6 +238,9 @@ func (r *TradeRepository) ListTopCopyWalletCandidates(ctx context.Context, limit
 		FROM stats
 		WHERE win_rate_pct >= 80
 			AND net_pnl > 0
+			AND closed_count >= 10
+			AND total_cost >= 20
+			AND profit_per_usdc >= 0.02
 		ORDER BY win_rate_pct DESC, net_pnl DESC, closed_count DESC
 		LIMIT $1
 	`, limit)
@@ -487,6 +496,60 @@ func (r *TradeRepository) MarkCopyWalletError(ctx context.Context, wallet string
 		WHERE wallet = $1
 	`, wallet, errText)
 	return err
+}
+
+func (r *TradeRepository) DisableCopyWalletsByLoss(ctx context.Context, maxLoss float64) ([]DisabledCopyWallet, error) {
+	if maxLoss <= 0 {
+		return nil, nil
+	}
+
+	rows, err := r.db.Query(ctx, `
+		WITH losers AS (
+			SELECT
+				source_wallet AS wallet,
+				ROUND(SUM(COALESCE(total_pnl, 0)), 6) AS net_pnl,
+				COUNT(*) AS trades
+			FROM copy_orders
+			WHERE source_wallet IS NOT NULL
+				AND source_wallet <> ''
+				AND submit_success = true
+				AND COALESCE(matched_size, 0) > 0
+			GROUP BY source_wallet
+			HAVING SUM(COALESCE(total_pnl, 0)) <= -$1
+		),
+		disabled AS (
+			UPDATE copy_wallet AS cw
+			SET
+				enable = 0,
+				last_error = '跟单净亏超过保护线，已自动停用',
+				updated_at = now()
+			FROM losers
+			WHERE lower(cw.wallet) = lower(losers.wallet)
+				AND cw.enable = 1
+			RETURNING cw.wallet, losers.net_pnl, losers.trades
+		)
+		SELECT wallet, net_pnl, trades
+		FROM disabled
+	`, maxLoss)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var disabled []DisabledCopyWallet
+	for rows.Next() {
+		var row DisabledCopyWallet
+		if err := rows.Scan(&row.Wallet, &row.NetPNL, &row.Trades); err != nil {
+			return nil, err
+		}
+		disabled = append(disabled, row)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return disabled, nil
 }
 
 func (r *TradeRepository) GetAvailableCopyPosition(ctx context.Context, assetID string) (float64, error) {

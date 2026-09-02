@@ -23,6 +23,8 @@ type Config struct {
 	CopyMode            string
 	CopyUSDC            float64
 	MinCopyUSDC         float64
+	MinSourceNotional   float64
+	MaxWalletLoss       float64
 	CopyTradeLimit      int
 	CopyPriceOffset     float64
 	MinCopyPrice        float64
